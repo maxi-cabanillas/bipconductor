@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "727481287200",
+    "firebase_url": "https://macuberdidi-conductor-default-rtdb.firebaseio.com",
+    "project_id": "macuberdidi-conductor",
+    "storage_bucket": "macuberdidi-conductor.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:727481287200:android:205cde0d7c1d035624f245",
+        "android_client_info": {
+          "package_name": "com.macmovil.driver"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAoADgz4godD2rdNZNCDz3_pao7BJlxOTo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
