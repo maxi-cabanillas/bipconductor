@@ -3,6 +3,7 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_driver/pages/NavigatorPages/managevehicles.dart';
 import 'package:flutter_driver/pages/login/landingpage.dart';
 import '../../functions/functions.dart';
@@ -103,6 +104,17 @@ class _CarInformationState extends State<CarInformation> {
             (route) => false);
       });
     }
+  }
+
+  @override
+  void dispose() {
+    modelcontroller.dispose();
+    colorcontroller.dispose();
+    numbercontroller.dispose();
+    referralcontroller.dispose();
+    custommakecontroller.dispose();
+    custommodelcontroller.dispose();
+    super.dispose();
   }
 
   @override
@@ -924,11 +936,12 @@ class _CarInformationState extends State<CarInformation> {
                                                                               Row(
                                                                             children: [
                                                                               if (vehicleType[k]['icon'] != null)
-                                                                                Image.network(
-                                                                                  vehicleType[k]['icon'].toString(),
+                                                                                CachedNetworkImage(
+                                                                                  imageUrl: vehicleType[k]['icon'].toString(),
                                                                                   fit: BoxFit.contain,
                                                                                   width: media.width * 0.1,
                                                                                   height: media.width * 0.08,
+                                                                                  errorWidget: (context, url, error) => const SizedBox(),
                                                                                 ),
                                                                               const SizedBox(
                                                                                 width: 10,

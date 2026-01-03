@@ -9,6 +9,7 @@ import 'package:flutter_driver/pages/login/landingpage.dart';
 import 'package:flutter_driver/widgets/glassmorphism.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
 import '../../functions/functions.dart';
@@ -117,7 +118,7 @@ class _EditProfileState extends State<EditProfile> {
     var permission = await getGalleryPermission();
     if (permission == PermissionStatus.granted) {
       final pickedFile =
-          await picker.pickImage(source: ImageSource.gallery, imageQuality: 50);
+          await picker.pickImage(source: ImageSource.gallery, imageQuality: 50, maxWidth: 1024, maxHeight: 1024);
       setState(() {
         proImageFile = pickedFile?.path;
         _pickImage = false;
@@ -134,7 +135,7 @@ class _EditProfileState extends State<EditProfile> {
     var permission = await getCameraPermission();
     if (permission == PermissionStatus.granted) {
       final pickedFile =
-          await picker.pickImage(source: ImageSource.camera, imageQuality: 50);
+          await picker.pickImage(source: ImageSource.camera, imageQuality: 50, maxWidth: 1024, maxHeight: 1024);
       setState(() {
         proImageFile = pickedFile?.path;
         _pickImage = false;
@@ -165,9 +166,21 @@ class _EditProfileState extends State<EditProfile> {
     Navigator.pop(context, true);
   }
 
+
+  @override
+  void dispose() {
+    name.dispose();
+    lastname.dispose();
+    email.dispose();
+    mobilenum.dispose();
+    usergender.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     var media = MediaQuery.of(context).size;
+    final String profileUrl = (userDetails['profile_picture'] ?? '').toString();
     return SafeArea(
       child: Material(
         child: Stack(
@@ -203,11 +216,11 @@ class _EditProfileState extends State<EditProfile> {
                               shape: BoxShape.circle,
                               color: page,
                               image: (proImageFile == null)
-                                  ? DecorationImage(
-                                      image: NetworkImage(
-                                        userDetails['profile_picture'],
-                                      ),
-                                      fit: BoxFit.cover)
+                                  ? (profileUrl.isNotEmpty
+                                      ? DecorationImage(
+                                          image: CachedNetworkImageProvider(profileUrl),
+                                          fit: BoxFit.cover)
+                                      : null)
                                   : DecorationImage(
                                       image: FileImage(File(proImageFile)),
                                       fit: BoxFit.cover)),

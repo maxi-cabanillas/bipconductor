@@ -2724,7 +2724,9 @@ class _MapsState extends State<Maps>
                             }
                           }
                         }
-                        return SingleChildScrollView(
+                        return SizedBox(
+                          width: media.width,
+                          height: media.height - MediaQuery.of(context).padding.vertical,
                           child: Stack(
                             children: [
                               Container(
@@ -5065,7 +5067,7 @@ class _MapsState extends State<Maps>
                                                                               decoration: BoxDecoration(
                                                                                 shape: BoxShape.circle,
                                                                                 image: DecorationImage(
-                                                                                   image: CachedNetworkImageProvider(driverReq['userDetail']['data']['profile_picture'].toString()),
+                                                                                  image: CachedNetworkImageProvider(driverReq['userDetail']['data']['profile_picture'].toString()),
                                                                                   fit: BoxFit.cover,
                                                                                 ),
                                                                               ),

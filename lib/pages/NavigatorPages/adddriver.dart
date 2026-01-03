@@ -1,6 +1,7 @@
 // ignore_for_file: use_build_context_synchronously, deprecated_member_use
 
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_driver/pages/login/landingpage.dart';
 import 'package:flutter_driver/widgets/glassmorphism.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -85,6 +86,15 @@ class _AddDriverState extends State<AddDriver> {
         Navigator.pop(context, true);
       });
     });
+  }
+
+  @override
+  void dispose() {
+    name.dispose();
+    email.dispose();
+    mobile.dispose();
+    address.dispose();
+    super.dispose();
   }
 
   @override
@@ -268,7 +278,7 @@ class _AddDriverState extends State<AddDriver> {
                                                                                           children: [
                                                                                             Row(
                                                                                               children: [
-                                                                                                Image.network(countries[i]['flag']),
+                                                                                                CachedNetworkImage(imageUrl: countries[i]['flag'].toString(), width: media.width * 0.08, height: media.width * 0.05, fit: BoxFit.cover, errorWidget: (c,u,e)=>const SizedBox()),
                                                                                                 SizedBox(
                                                                                                   width: media.width * 0.02,
                                                                                                 ),
@@ -301,7 +311,7 @@ class _AddDriverState extends State<AddDriver> {
                                                                                               children: [
                                                                                                 Row(
                                                                                                   children: [
-                                                                                                    Image.network(countries[i]['flag']),
+                                                                                                    CachedNetworkImage(imageUrl: countries[i]['flag'].toString(), width: media.width * 0.08, height: media.width * 0.05, fit: BoxFit.cover, errorWidget: (c,u,e)=>const SizedBox()),
                                                                                                     SizedBox(
                                                                                                       width: media.width * 0.02,
                                                                                                     ),
@@ -343,8 +353,7 @@ class _AddDriverState extends State<AddDriver> {
                                           crossAxisAlignment:
                                               CrossAxisAlignment.center,
                                           children: [
-                                            Image.network(
-                                                countries[phcode]['flag']),
+                                            CachedNetworkImage(imageUrl: countries[phcode]['flag'].toString(), width: media.width * 0.08, height: media.width * 0.05, fit: BoxFit.cover, errorWidget: (c,u,e)=>const SizedBox()),
                                             SizedBox(
                                               width: media.width * 0.02,
                                             ),

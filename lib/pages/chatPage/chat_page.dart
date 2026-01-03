@@ -56,6 +56,13 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   @override
+  void dispose() {
+    chatText.dispose();
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     var media = MediaQuery.of(context).size;
     return PopScope(
@@ -72,6 +79,7 @@ class _ChatPageState extends State<ChatPage> {
                   valueListenable: valueNotifierHome.value,
                   builder: (context, value, child) {
                     WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (!controller.hasClients) return;
                       controller.animateTo(controller.position.maxScrollExtent,
                           duration: const Duration(milliseconds: 500),
                           curve: Curves.ease);

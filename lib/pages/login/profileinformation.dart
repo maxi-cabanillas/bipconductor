@@ -63,6 +63,12 @@ class _ProfileInformationState extends State<ProfileInformation>
 
   @override
   void dispose() {
+    firstname.dispose();
+    lastname.dispose();
+    emailText.dispose();
+    mobile.dispose();
+    pinText.dispose();
+    genderText.dispose();
     _controller.dispose();
     super.dispose();
   }

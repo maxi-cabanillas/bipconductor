@@ -1,5 +1,7 @@
 // ignore_for_file: use_build_context_synchronously, deprecated_member_use
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_driver/pages/login/landingpage.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -30,6 +32,7 @@ class _BankDetailsState extends State<BankDetails> {
   bool _isLoading = true;
   String _showError = '';
   bool _edit = false;
+  Timer? _errorTimer;
 
   @override
   void initState() {
@@ -69,8 +72,10 @@ class _BankDetailsState extends State<BankDetails> {
   }
 
 //showing error
-  _errorClear() async {
-    Future.delayed(const Duration(seconds: 4), () {
+  _errorClear() {
+    _errorTimer?.cancel();
+    _errorTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted) return;
       setState(() {
         _showError = '';
       });
@@ -80,6 +85,16 @@ class _BankDetailsState extends State<BankDetails> {
   //navigate pop
   pop() {
     Navigator.pop(context, true);
+  }
+
+  @override
+  void dispose() {
+    _errorTimer?.cancel();
+    holderName.dispose();
+    bankName.dispose();
+    accountNumber.dispose();
+    bankCode.dispose();
+    super.dispose();
   }
 
   @override

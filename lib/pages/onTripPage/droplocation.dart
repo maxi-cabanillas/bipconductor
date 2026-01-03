@@ -1561,15 +1561,19 @@ class _DropLocationState extends State<DropLocation>
 
 class Debouncer {
   final int milliseconds;
-  dynamic action;
-  dynamic _timer;
+  Timer? _timer;
 
   Debouncer({required this.milliseconds});
 
-  run(VoidCallback action) {
-    if (null != _timer) {
-      _timer.cancel();
-    }
+  void run(void Function() action) {
+    _timer?.cancel();
     _timer = Timer(Duration(milliseconds: milliseconds), action);
   }
+
+  void cancel() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  void dispose() => cancel();
 }
