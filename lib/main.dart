@@ -68,11 +68,11 @@ void main() async {
   ]);
 
   await Firebase.initializeApp();
-  initMessaging();
-  checkInternetConnection();
-  currentPositionUpdate();
+  await initMessaging();
+  await checkInternetConnection();
+  await currentPositionUpdate();
 
-  Workmanager().initialize(callbackDispatcher, isInDebugMode: false);
+  await Workmanager().initialize(callbackDispatcher, isInDebugMode: false);
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
   runApp(const MyApp());
@@ -93,7 +93,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    Workmanager().cancelAll();
+    Workmanager().cancelByUniqueName('bg_location');
 
     if (Platform.isAndroid) {
       initQuickNav();
@@ -162,9 +162,15 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       if (state == AppLifecycleState.resumed) {
         // App volvió al foreground
         stopBubbleHead();
-        Workmanager().cancelAll();
+    Workmanager().cancelByUniqueName('bg_location');
       }
     }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
   @override
@@ -199,20 +205,17 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 // -------------------------------------------------------------
 // PERIODIC LOCATION UPDATES
 // -------------------------------------------------------------
-void updateLocation(int initialDelayMinutes) {
-  // NOTE: WorkManager periodic tasks have a minimum interval of 15 minutes on Android.
-  // If you need sub-minute / 5s updates in background, you'll need a Foreground Service.
+void updateLocation(int durationMinutes) {
   if (userDetails.isEmpty || userDetails['id'] == null) return;
 
   final id = userDetails['id'].toString();
-  final safeDelay = initialDelayMinutes < 0 ? 0 : initialDelayMinutes;
+  final freq = Duration(minutes: durationMinutes < 15 ? 15 : durationMinutes);
 
-  // Register ONE periodic task (avoid scheduling 15 tasks).
+  // Single periodic task (avoids scheduling many staggered tasks)
   Workmanager().registerPeriodicTask(
     'bg_location',
-    'bg_location',
-    initialDelay: Duration(minutes: safeDelay),
-    frequency: const Duration(minutes: 15),
+    'update_locs',
+    frequency: freq,
     constraints: Constraints(
       networkType: NetworkType.connected,
       requiresBatteryNotLow: false,

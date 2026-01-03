@@ -19,7 +19,7 @@ int id = 0;
 
 void notificationTapBackground(NotificationResponse notificationResponse) {
   isGeneral = true;
-  valueNotifierHome.incrementNotifier();
+  notifyHomeThrottled();
 }
 
 var androidDetails = const AndroidNotificationDetails(
@@ -58,7 +58,7 @@ Future<void> initMessaging() async {
       if (message?.data['push_type'] == 'general') {
         latestNotification = message?.data['message'];
         isGeneral = true;
-        valueNotifierHome.incrementNotifier();
+        notifyHomeThrottled();
       }
     }
   });
@@ -86,7 +86,7 @@ Future<void> initMessaging() async {
     if (message.data['push_type'].toString() == 'general') {
       latestNotification = message.data['message'];
       isGeneral = true;
-      valueNotifierHome.incrementNotifier();
+      notifyHomeThrottled();
     }
   });
 }
@@ -94,14 +94,14 @@ Future<void> initMessaging() async {
 Future<String> _downloadAndSaveFile(String url, String fileName) async {
   final Directory directory = await getApplicationDocumentsDirectory();
   final String filePath = '${directory.path}/$fileName';
-  final http.Response response = await http.get(Uri.parse(url));
+  final http.Response response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
   final File file = File(filePath);
   await file.writeAsBytes(response.bodyBytes);
   return filePath;
 }
 
 Future<Uint8List> _getByteArrayFromUrl(String url) async {
-  final http.Response response = await http.get(Uri.parse(url));
+  final http.Response response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
   return response.bodyBytes;
 }
 
@@ -153,7 +153,7 @@ Future<void> _showBigPictureNotificationURLGeneral(message) async {
     await fltNotification.show(
         id++, message['title'], message['message'], notificationDetails);
   }
-  id = id++;
+  // id++ already used above; do not reset here
 }
 
 Future<void> _showGeneralNotification(message) async {
@@ -179,7 +179,7 @@ Future<void> _showGeneralNotification(message) async {
       onDidReceiveBackgroundNotificationResponse: notificationTapBackground);
   await fltNotification.show(
       id++, message['title'], message['message'], notificationDetails);
-  id = id++;
+  // id++ already used above; do not reset here
 }
 
 Future<void> showOtpNotification(message) async {
@@ -205,7 +205,7 @@ Future<void> showOtpNotification(message) async {
   rideNotification.initialize(initSetting);
   await rideNotification.show(id++, message.title.toString(),
       message.body.toString(), notificationDetails);
-  id = id++;
+  // id++ already used above; do not reset here
 }
 
 Future<void> showRideNotification(message) async {
@@ -231,5 +231,5 @@ Future<void> showRideNotification(message) async {
   rideNotification.initialize(initSetting);
   await rideNotification.show(id++, message.title.toString(),
       message.body.toString(), notificationDetails);
-  id = id++;
+  // id++ already used above; do not reset here
 }

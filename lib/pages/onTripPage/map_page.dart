@@ -566,7 +566,7 @@ class _MapsState extends State<Maps>
 
     // fuerza rebuild del mapa/panel (usa ValueListenableBuilder)
     try {
-      valueNotifierHome.incrementNotifier();
+      notifyHomeThrottled();
     } catch (_) {
       // ignore
     }
@@ -602,7 +602,7 @@ class _MapsState extends State<Maps>
       _setKeepScreenOn(true);
       if (_controller != null) {
         _controller!.setMapStyle(mapStyle);
-        valueNotifierHome.incrementNotifier();
+        notifyHomeThrottled();
       }
       isBackground = false;
       _startLiveDriverTracking();
@@ -709,7 +709,7 @@ class _MapsState extends State<Maps>
               _animateToDriver(latLng, newHeading);
             }
 
-            valueNotifierHome.incrementNotifier();
+            notifyHomeThrottled();
           });
     } catch (_) {}
   }
@@ -1017,6 +1017,10 @@ class _MapsState extends State<Maps>
   void dispose() {
     _setKeepScreenOn(false);
     _stopLiveDriverTracking();
+    WidgetsBinding.instance.removeObserver(this);
+    _mapMarkerSC.close();
+    _cont.dispose();
+    bidText.dispose();
     if (_timer != null) {
       _timer.cancel();
     }
@@ -10565,7 +10569,7 @@ class _TRipBottomSheetConfrimationState
                         .toString() ==
                         '1') {
                       unloadImage = true;
-                      valueNotifierHome.incrementNotifier();
+                      notifyHomeThrottled();
 
                       Navigator.pop(context);
                     } else if (driverReq['enable_shipment_unload_feature']

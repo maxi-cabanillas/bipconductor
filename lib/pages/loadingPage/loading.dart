@@ -16,11 +16,12 @@ class _LoadingState extends State<Loading> {
   var _size1 = 10.0;
   var _size2 = 5.0;
   var _size3 = 5.0;
+  Timer? _loaderTimer;
 
   @override
   void initState() {
     // loader
-    Timer.periodic(const Duration(milliseconds: 250), (timer) {
+    _loaderTimer = Timer.periodic(const Duration(milliseconds: 250), (timer) {
       if (mounted) {
         setState(() {
           if (_size1 == 10.0) {
@@ -38,6 +39,12 @@ class _LoadingState extends State<Loading> {
     });
 
     super.initState();
+  }
+
+  @override
+  void dispose() {
+    _loaderTimer?.cancel();
+    super.dispose();
   }
 
   @override

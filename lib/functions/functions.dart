@@ -65,14 +65,19 @@ String url = 'https://bipp.com.ar/'; //add '/' at the end of the url as 'https:/
 // Prefer using --dart-define to avoid hardcoding secrets.
 // Example:
 //   flutter run --dart-define=MAPS_API_KEY_ANDROID=XXXX --dart-define=MAPS_API_KEY_IOS=YYYY
-//
-// IMPORTANT: Since this repo already contained a key, you should rotate/restrict it in Google Cloud Console.
-const String _fallbackAndroidMapKey = 'AIzaSyAoADgz4godD2rdNZNCDz3_pao7BJlxOTo';
-const String _fallbackIosMapKey = 'ios map key';
-const String _androidMapKey = String.fromEnvironment('MAPS_API_KEY_ANDROID', defaultValue: _fallbackAndroidMapKey);
-const String _iosMapKey = String.fromEnvironment('MAPS_API_KEY_IOS', defaultValue: _fallbackIosMapKey);
+const String _androidMapKey = String.fromEnvironment('MAPS_API_KEY_ANDROID');
+const String _iosMapKey = String.fromEnvironment('MAPS_API_KEY_IOS');
 
 String mapkey = Platform.isAndroid ? _androidMapKey : _iosMapKey;
+
+// UI notifier throttle (prevents rebuild spam on fast GPS / streams)
+DateTime _lastHomeNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
+void notifyHomeThrottled([Duration minInterval = const Duration(milliseconds: 250)]) {
+  final now = DateTime.now();
+  if (now.difference(_lastHomeNotifyAt) < minInterval) return;
+  _lastHomeNotifyAt = now;
+  notifyHomeThrottled();
+}
 
 String mapStyle = '';
 String mapType = '';
@@ -127,7 +132,7 @@ getDetailsOfDevice() async {
     // Sync polyline (Google Maps) desde polyList — una sola polyline, sin duplicados
     syncGooglePolylineFromPolyList();
     if (mapType == 'google') {
-      valueNotifierHome.incrementNotifier();
+      notifyHomeThrottled();
     }
   } catch (e) {
     debugPrint(e.toString());
@@ -1881,8 +1886,7 @@ currentPositionUpdate() async {
           };
 
           // Push static/meta fields only when they change (or every 5 minutes as a safety refresh)
-          final metaHash =
-              '${userDetails['mobile']}|${userDetails['name']}|${userDetails['profile_picture']}|${userDetails['rating']}|${userDetails['vehicle_type_icon_for']}|${userDetails['car_number']}|${userDetails['car_make_name']}|${userDetails['vehicle_type_id']}|${userDetails['vehicle_types']}|${userDetails['owner_id']}|${userDetails['service_location_id']}|${userDetails['transport_type']}';
+          final metaHash = "${userDetails['mobile']}|${userDetails['name']}|${userDetails['profile_picture']}|${userDetails['rating']}|${userDetails['vehicle_type_icon_for']}|${userDetails['car_number']}|${userDetails['car_make_name']}|${userDetails['vehicle_type_id']}|${userDetails['vehicle_types']}|${userDetails['owner_id']}|${userDetails['service_location_id']}|${userDetails['transport_type']}";
 
           final shouldPushMeta = _lastDriverMetaHash != metaHash ||
               _lastDriverMetaPushAt == null ||
@@ -1930,11 +1934,11 @@ currentPositionUpdate() async {
             }
           }
 
-          valueNotifierHome.incrementNotifier();
+          notifyHomeThrottled();
         } catch (e) {
           if (e is SocketException) {
             internet = false;
-            valueNotifierHome.incrementNotifier();
+            notifyHomeThrottled();
           }
         }
       } else if (userDetails['active'] == false &&
@@ -1964,12 +1968,12 @@ currentPositionUpdate() async {
             if (userDetails['active'] == true) {
               await driverStatus();
             }
-            valueNotifierHome.incrementNotifier();
+            notifyHomeThrottled();
             //audioPlayer.play(audio);
           } else if (driverState.child('approve').value == 1 &&
               userDetails['approve'] == false) {
             await getUserDetails();
-            valueNotifierHome.incrementNotifier();
+            notifyHomeThrottled();
 
             //audioPlayer.play(audio);
           }
@@ -1979,7 +1983,7 @@ currentPositionUpdate() async {
                 .child('drivers/driver_${userDetails['id']}')
                 .update({'fleet_changed': 0});
             await getUserDetails();
-            valueNotifierHome.incrementNotifier();
+            notifyHomeThrottled();
 
             //audioPlayer.play(audio);
           }
@@ -1989,7 +1993,7 @@ currentPositionUpdate() async {
                 .child('drivers/driver_${userDetails['id']}')
                 .remove();
             await getUserDetails();
-            valueNotifierHome.incrementNotifier();
+            notifyHomeThrottled();
           }
           if (driverState.key!.contains('vehicle_type_icon')) {
             if (driverState.child('vehicle_type_icon') !=
@@ -2018,12 +2022,12 @@ currentPositionUpdate() async {
           userDetails['approve'] == true) {
         await getUserDetails();
 
-        valueNotifierHome.incrementNotifier();
+        notifyHomeThrottled();
       } else if (ownerStatus.child('approve').value == 1 &&
           userDetails['approve'] == false) {
         await getUserDetails();
       }
-      valueNotifierHome.incrementNotifier();
+      notifyHomeThrottled();
     }
   });
 }
