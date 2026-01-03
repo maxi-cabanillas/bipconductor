@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 // import 'package:dash_bubble/dash_bubble.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_driver/pages/login/landingpage.dart';
@@ -2724,9 +2726,9 @@ class _MapsState extends State<Maps>
                             }
                           }
                         }
-                        return SizedBox(
-                          width: media.width,
-                          height: media.height - MediaQuery.of(context).padding.vertical,
+                        return SingleChildScrollView(
+                          physics: const NeverScrollableScrollPhysics(),
+                          primary: false,
                           child: Stack(
                             children: [
                               Container(
@@ -3022,6 +3024,9 @@ class _MapsState extends State<Maps>
                                                         MediaQuery.of(context).padding.top;
 
                                                 return GoogleMap(
+                                                  gestureRecognizers: <Factory<OneSequenceGestureRecognizer>>{
+                                                    Factory<OneSequenceGestureRecognizer>(() => EagerGestureRecognizer()),
+                                                  },
                                                   padding: EdgeInsets.only(
                                                     bottom: (driverReq['accepted_at'] != null)
                                                         ? (_panelVisible + MediaQuery.of(context).padding.bottom + 8)
@@ -5067,7 +5072,7 @@ class _MapsState extends State<Maps>
                                                                               decoration: BoxDecoration(
                                                                                 shape: BoxShape.circle,
                                                                                 image: DecorationImage(
-                                                                                  image: CachedNetworkImageProvider(driverReq['userDetail']['data']['profile_picture'].toString()),
+                                                                                   image: CachedNetworkImageProvider(driverReq['userDetail']['data']['profile_picture'].toString()),
                                                                                   fit: BoxFit.cover,
                                                                                 ),
                                                                               ),
