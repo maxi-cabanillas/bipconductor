@@ -73,6 +73,7 @@ dependencies:
   flutter_tts: ^4.2.3
   speech_to_text: ^7.3.0
 
+  latlong2: any
 dependency_overrides:
 #  wake_lock package depend on package_info latest version but we used lower version so it ovverride
   package_info_plus: ^4.1.0

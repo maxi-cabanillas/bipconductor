@@ -66,6 +66,32 @@ String mapkey =
 String mapStyle = '';
 String mapType = '';
 
+/// Mantiene UNA sola polyline en Google Maps, tomada desde `polyList`.
+/// Esto evita que aparezcan rutas duplicadas o con colores distintos (morada/azul).
+void syncGooglePolylineFromPolyList() {
+  if (mapType != 'google') return;
+
+  // Always keep a single polyline in the set
+  polyline.clear();
+
+  if (polyList.isEmpty) return;
+
+  polyline.add(
+    Polyline(
+      polylineId: const PolylineId('route'),
+      visible: true,
+      color: Colors.blue,
+      width: 5,
+      points: List<LatLng>.from(polyList),
+      startCap: Cap.roundCap,
+      endCap: Cap.roundCap,
+      jointType: JointType.round,
+      geodesic: true,
+    ),
+  );
+}
+
+
 getDetailsOfDevice() async {
   var connectivityResult = await (Connectivity().checkConnectivity());
   if (connectivityResult == ConnectivityResult.none) {
@@ -80,18 +106,9 @@ getDetailsOfDevice() async {
     // }
     darktheme();
 
-    // Sync polyline una vez al final
+    // Sync polyline (Google Maps) desde polyList — una sola polyline, sin duplicados
+    syncGooglePolylineFromPolyList();
     if (mapType == 'google') {
-      polyline.clear();
-      if (polyList.isNotEmpty) {
-        polyline.add(Polyline(
-          polylineId: const PolylineId('route_raw_rebuild'),
-          visible: true,
-          color: Colors.blue,
-          width: 4,
-          points: List<LatLng>.from(polyList),
-        ));
-      }
       valueNotifierHome.incrementNotifier();
     }
   } catch (e) {
@@ -3107,18 +3124,9 @@ getPolylines(animate) async {
       }
     }
   }
-  // Actualizar polyline UNA sola vez (evita duplicados y reduce rebuild)
+  // Sync polyline (Google Maps) desde polyList — una sola polyline
   if (mapType == 'google') {
-    polyline.clear();
-    if (polyList.isNotEmpty) {
-      polyline.add(Polyline(
-        polylineId: const PolylineId('route_raw'),
-        visible: true,
-        color: Colors.blue,
-        width: 4,
-        points: List<LatLng>.from(polyList),
-      ));
-    }
+    syncGooglePolylineFromPolyList();
     valueNotifierHome.incrementNotifier();
   }
 
@@ -3251,6 +3259,13 @@ Future<void> rebuildRoutePolylinesFromCurrent() async {
       // Próximo tramo
       origin = dest.latlng;
     }
+
+    // Sync polyline (Google Maps) desde polyList — una sola polyline
+    if (mapType == 'google') {
+      syncGooglePolylineFromPolyList();
+      valueNotifierHome.incrementNotifier();
+    }
+
   } catch (e) {
     if (e is SocketException) {
       internet = false;
