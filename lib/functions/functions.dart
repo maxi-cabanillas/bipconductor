@@ -60,11 +60,29 @@ String signKey = '';
 
 //base url
 String url = 'https://bipp.com.ar/'; //add '/' at the end of the url as 'https://url.com/'
-String mapkey =
-(platform == TargetPlatform.android) ? 'AIzaSyAoADgz4godD2rdNZNCDz3_pao7BJlxOTo' : 'ios map key';
+
+// Google Maps API keys
+// Prefer using --dart-define to avoid hardcoding secrets.
+// Example:
+//   flutter run --dart-define=MAPS_API_KEY_ANDROID=XXXX --dart-define=MAPS_API_KEY_IOS=YYYY
+//
+// IMPORTANT: Since this repo already contained a key, you should rotate/restrict it in Google Cloud Console.
+const String _fallbackAndroidMapKey = 'AIzaSyAoADgz4godD2rdNZNCDz3_pao7BJlxOTo';
+const String _fallbackIosMapKey = 'ios map key';
+const String _androidMapKey = String.fromEnvironment('MAPS_API_KEY_ANDROID', defaultValue: _fallbackAndroidMapKey);
+const String _iosMapKey = String.fromEnvironment('MAPS_API_KEY_IOS', defaultValue: _fallbackIosMapKey);
+
+String mapkey = Platform.isAndroid ? _androidMapKey : _iosMapKey;
 
 String mapStyle = '';
 String mapType = '';
+
+// ---------------------------------------------------------------------------
+// Realtime DB optimization caches (avoid pushing static fields every 5 seconds)
+// ---------------------------------------------------------------------------
+DateTime? _lastDriverMetaPushAt;
+String _lastDriverMetaHash = '';
+DateTime? _lastDriverStateCheckAt;
 
 /// Mantiene UNA sola polyline en Google Maps, tomada desde `polyList`.
 /// Esto evita que aparezcan rutas duplicadas o con colores distintos (morada/azul).
@@ -1815,6 +1833,7 @@ currentPositionUpdate() async {
   GeoHasher geo = GeoHasher();
 
   Timer.periodic(const Duration(seconds: 5), (timer) async {
+    final tickNow = DateTime.now();
     if (userDetails.isNotEmpty && userDetails['role'] == 'driver') {
       serviceEnabled =
       await geolocs.GeolocatorPlatform.instance.isLocationServiceEnabled();
@@ -1849,29 +1868,50 @@ currentPositionUpdate() async {
         final firebase = FirebaseDatabase.instance.ref();
         // center = LatLng(11.0640986, 76.9984439);
         try {
-          firebase.child('drivers/driver_${userDetails['id']}').update({
+          if (center == null) return;
+          final payload = <String, dynamic>{
             'bearing': heading,
-            'date': DateTime.now().toString(),
+            'date': tickNow.toIso8601String(),
             'id': userDetails['id'],
-            'g': geo.encode(double.parse(center.longitude.toString()),
-                double.parse(center.latitude.toString())),
+            'g': geo.encode(center.longitude, center.latitude),
             'is_active': userDetails['active'] == true ? 1 : 0,
             'is_available': userDetails['available'],
             'l': {'0': center.latitude, '1': center.longitude},
-            'mobile': userDetails['mobile'],
-            'name': userDetails['name'],
-            'profile_picture': userDetails['profile_picture'],
-            'rating': userDetails['rating'],
-            'vehicle_type_icon': userDetails['vehicle_type_icon_for'],
             'updated_at': ServerValue.timestamp,
-            'vehicle_number': userDetails['car_number'],
-            'vehicle_type_name': userDetails['car_make_name'],
-            'vehicle_type': userDetails['vehicle_type_id'],
-            'vehicle_types': userDetails['vehicle_types'],
-            'ownerid': userDetails['owner_id'],
-            'service_location_id': userDetails['service_location_id'],
-            'transport_type': userDetails['transport_type'],
-          });
+          };
+
+          // Push static/meta fields only when they change (or every 5 minutes as a safety refresh)
+          final metaHash =
+              '${userDetails['mobile']}|${userDetails['name']}|${userDetails['profile_picture']}|${userDetails['rating']}|${userDetails['vehicle_type_icon_for']}|${userDetails['car_number']}|${userDetails['car_make_name']}|${userDetails['vehicle_type_id']}|${userDetails['vehicle_types']}|${userDetails['owner_id']}|${userDetails['service_location_id']}|${userDetails['transport_type']}';
+
+          final shouldPushMeta = _lastDriverMetaHash != metaHash ||
+              _lastDriverMetaPushAt == null ||
+              tickNow.difference(_lastDriverMetaPushAt!) >
+                  const Duration(minutes: 5);
+
+          if (shouldPushMeta) {
+            payload.addAll({
+              'mobile': userDetails['mobile'],
+              'name': userDetails['name'],
+              'profile_picture': userDetails['profile_picture'],
+              'rating': userDetails['rating'],
+              'vehicle_type_icon': userDetails['vehicle_type_icon_for'],
+              'vehicle_number': userDetails['car_number'],
+              'vehicle_type_name': userDetails['car_make_name'],
+              'vehicle_type': userDetails['vehicle_type_id'],
+              'vehicle_types': userDetails['vehicle_types'],
+              'ownerid': userDetails['owner_id'],
+              'service_location_id': userDetails['service_location_id'],
+              'transport_type': userDetails['transport_type'],
+            });
+
+            _lastDriverMetaHash = metaHash;
+            _lastDriverMetaPushAt = tickNow;
+          }
+
+          await firebase
+              .child('drivers/driver_${userDetails['id']}')
+              .update(payload);
           if (driverReq.isNotEmpty) {
             if (driverReq['accepted_at'] != null &&
                 driverReq['is_completed'] == 0) {
@@ -1910,58 +1950,64 @@ currentPositionUpdate() async {
             desiredAccuracy: geolocs.LocationAccuracy.low);
       }
       if (userDetails['role'] == 'driver') {
-        var driverState = await FirebaseDatabase.instance
-            .ref('drivers/driver_${userDetails['id']}')
-            .get();
-        if (driverState.child('approve').value == 0 &&
-            userDetails['approve'] == true) {
-          await getUserDetails();
-          if (userDetails['active'] == true) {
-            await driverStatus();
+        final shouldCheckDriverState = _lastDriverStateCheckAt == null ||
+            tickNow.difference(_lastDriverStateCheckAt!) >
+                const Duration(seconds: 30);
+        if (shouldCheckDriverState) {
+          _lastDriverStateCheckAt = tickNow;
+          var driverState = await FirebaseDatabase.instance
+              .ref('drivers/driver_${userDetails['id']}')
+              .get();
+          if (driverState.child('approve').value == 0 &&
+              userDetails['approve'] == true) {
+            await getUserDetails();
+            if (userDetails['active'] == true) {
+              await driverStatus();
+            }
+            valueNotifierHome.incrementNotifier();
+            //audioPlayer.play(audio);
+          } else if (driverState.child('approve').value == 1 &&
+              userDetails['approve'] == false) {
+            await getUserDetails();
+            valueNotifierHome.incrementNotifier();
+
+            //audioPlayer.play(audio);
           }
-          valueNotifierHome.incrementNotifier();
-          //audioPlayer.play(audio);
-        } else if (driverState.child('approve').value == 1 &&
-            userDetails['approve'] == false) {
-          await getUserDetails();
-          valueNotifierHome.incrementNotifier();
-
-          //audioPlayer.play(audio);
-        }
-        if (driverState.child('fleet_changed').value == 1) {
-          FirebaseDatabase.instance
-              .ref()
-              .child('drivers/driver_${userDetails['id']}')
-              .update({'fleet_changed': 0});
-          await getUserDetails();
-          valueNotifierHome.incrementNotifier();
-
-          //audioPlayer.play(audio);
-        }
-        if (driverState.child('is_deleted').value == 1) {
-          FirebaseDatabase.instance
-              .ref()
-              .child('drivers/driver_${userDetails['id']}')
-              .remove();
-          await getUserDetails();
-          valueNotifierHome.incrementNotifier();
-        }
-        if (driverState.key!.contains('vehicle_type_icon')) {
-          if (driverState.child('vehicle_type_icon') !=
-              userDetails['vehicle_type_icon_for']) {
+          if (driverState.child('fleet_changed').value == 1) {
             FirebaseDatabase.instance
                 .ref()
                 .child('drivers/driver_${userDetails['id']}')
-                .update({
-              'vehicle_type_icon': userDetails['vehicle_type_icon_for']
-            });
+                .update({'fleet_changed': 0});
+            await getUserDetails();
+            valueNotifierHome.incrementNotifier();
+
+            //audioPlayer.play(audio);
           }
-        } else {
-          FirebaseDatabase.instance
-              .ref()
-              .child('drivers/driver_${userDetails['id']}')
-              .update(
-              {'vehicle_type_icon': userDetails['vehicle_type_icon_for']});
+          if (driverState.child('is_deleted').value == 1) {
+            FirebaseDatabase.instance
+                .ref()
+                .child('drivers/driver_${userDetails['id']}')
+                .remove();
+            await getUserDetails();
+            valueNotifierHome.incrementNotifier();
+          }
+          if (driverState.key!.contains('vehicle_type_icon')) {
+            if (driverState.child('vehicle_type_icon') !=
+                userDetails['vehicle_type_icon_for']) {
+              FirebaseDatabase.instance
+                  .ref()
+                  .child('drivers/driver_${userDetails['id']}')
+                  .update({
+                'vehicle_type_icon': userDetails['vehicle_type_icon_for']
+              });
+            }
+          } else {
+            FirebaseDatabase.instance
+                .ref()
+                .child('drivers/driver_${userDetails['id']}')
+                .update(
+                {'vehicle_type_icon': userDetails['vehicle_type_icon_for']});
+          }
         }
       }
     } else if (userDetails['role'] == 'owner') {

@@ -199,25 +199,27 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 // -------------------------------------------------------------
 // PERIODIC LOCATION UPDATES
 // -------------------------------------------------------------
-void updateLocation(duration) {
+void updateLocation(int initialDelayMinutes) {
+  // NOTE: WorkManager periodic tasks have a minimum interval of 15 minutes on Android.
+  // If you need sub-minute / 5s updates in background, you'll need a Foreground Service.
   if (userDetails.isEmpty || userDetails['id'] == null) return;
 
   final id = userDetails['id'].toString();
+  final safeDelay = initialDelayMinutes < 0 ? 0 : initialDelayMinutes;
 
-  for (var i = 0; i < 15; i++) {
-    Workmanager().registerPeriodicTask(
-      'locs_$i',
-      'update_locs_$i',
-      initialDelay: Duration(minutes: i),
-      frequency: const Duration(minutes: 15),
-      constraints: Constraints(
-        networkType: NetworkType.connected,
-        requiresBatteryNotLow: false,
-        requiresCharging: false,
-        requiresDeviceIdle: false,
-        requiresStorageNotLow: false,
-      ),
-      inputData: {'id': id},
-    );
-  }
+  // Register ONE periodic task (avoid scheduling 15 tasks).
+  Workmanager().registerPeriodicTask(
+    'bg_location',
+    'bg_location',
+    initialDelay: Duration(minutes: safeDelay),
+    frequency: const Duration(minutes: 15),
+    constraints: Constraints(
+      networkType: NetworkType.connected,
+      requiresBatteryNotLow: false,
+      requiresCharging: false,
+      requiresDeviceIdle: false,
+      requiresStorageNotLow: false,
+    ),
+    inputData: {'id': id},
+  );
 }

@@ -55,7 +55,7 @@ dependencies:
   package_info_plus: ^8.1.4
   vector_math: ^2.1.1
   webview_flutter: ^4.2.4
-  path_provider: ^2.0.11
+  path_provider: ^2.1.5
   flutter_inappwebview: ^6.0.0
   uuid: ^4.4.2
   intl: ^0.20.2
@@ -74,6 +74,9 @@ dependencies:
   speech_to_text: ^7.3.0
 
   latlong2: any
+  flutter_image_compress: ^2.4.0
+  flutter_cache_manager: ^3.4.1
+  path: ^1.9.1
 dependency_overrides:
 #  wake_lock package depend on package_info latest version but we used lower version so it ovverride
   package_info_plus: ^4.1.0
