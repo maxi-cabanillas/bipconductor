@@ -26,6 +26,7 @@ import '../navDrawer/nav_drawer.dart';
 import '../vehicleInformations/docs_onprocess.dart';
 import 'droplocation.dart';
 import 'map_page.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 
 class RidePage extends StatefulWidget {
   const RidePage({super.key});
@@ -1023,7 +1024,7 @@ class _RidePageState extends State<RidePage> with WidgetsBindingObserver {
                                                                               media.width * 0.12,
                                                                           decoration: BoxDecoration(
                                                                               shape: BoxShape.circle,
-                                                                              image: DecorationImage(image: NetworkImage(rideList[key]['user_img']), fit: BoxFit.cover)),
+                                                                              image: DecorationImage(image: CachedNetworkImageProvider(rideList[key]['user_img'].toString()), fit: BoxFit.cover)),
                                                                         ),
                                                                         SizedBox(
                                                                           width:
@@ -1702,9 +1703,9 @@ class _RidePageState extends State<RidePage> with WidgetsBindingObserver {
                                                                       shape: BoxShape
                                                                           .circle,
                                                                       image: DecorationImage(
-                                                                          image: NetworkImage(choosenRide[0]
+                                                                          image: CachedNetworkImageProvider(choosenRide[0]
                                                                               [
-                                                                              'user_img']),
+                                                                              'user_img'].toString()),
                                                                           fit: BoxFit
                                                                               .cover)),
                                                                 ),
@@ -2233,7 +2234,7 @@ class _RidePageState extends State<RidePage> with WidgetsBindingObserver {
                                                                             width:
                                                                                 media.width * 0.1,
                                                                             decoration:
-                                                                                BoxDecoration(shape: BoxShape.circle, image: DecorationImage(image: NetworkImage(waitingList[0]['user_img']), fit: BoxFit.cover)),
+                                                                                BoxDecoration(shape: BoxShape.circle, image: DecorationImage(image: CachedNetworkImageProvider(waitingList[0]['user_img'].toString()), fit: BoxFit.cover)),
                                                                           ),
                                                                           SizedBox(
                                                                             height:

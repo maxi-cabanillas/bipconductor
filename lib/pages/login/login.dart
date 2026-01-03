@@ -102,7 +102,9 @@ class _LoginState extends State<Login> with TickerProviderStateMixin {
 
   @override
   void initState() {
-    currentPage = 0;
+    
+    profilepicturecontroller = StreamController.broadcast();
+currentPage = 0;
     controller.text = '';
     proImageFile1 = null;
     gender = '';
@@ -117,6 +119,19 @@ class _LoginState extends State<Login> with TickerProviderStateMixin {
   void dispose() {
     resendTime?.cancel();
     resendTime = null;
+    try {
+      profilepicturecontroller.close();
+    } catch (_) {}
+    controller.dispose();
+    _mobile.dispose();
+    _email.dispose();
+    _password.dispose();
+    _name.dispose();
+    _otp.dispose();
+    _newPassword.dispose();
+    _scroll.dispose();
+    aController.dispose();
+
     super.dispose();
   }
 
@@ -160,7 +175,7 @@ class _LoginState extends State<Login> with TickerProviderStateMixin {
     var permission = await getGalleryPermission();
     if (permission == PermissionStatus.granted) {
       final pickedFile =
-          await picker.pickImage(source: ImageSource.gallery, imageQuality: 50);
+          await picker.pickImage(source: ImageSource.gallery, imageQuality: 50, maxWidth: 720, maxHeight: 720);
 
       proImageFile1 = pickedFile?.path;
       pickImage = false;
@@ -177,7 +192,7 @@ class _LoginState extends State<Login> with TickerProviderStateMixin {
     var permission = await getCameraPermission();
     if (permission == PermissionStatus.granted) {
       final pickedFile =
-          await picker.pickImage(source: ImageSource.camera, imageQuality: 50);
+          await picker.pickImage(source: ImageSource.camera, imageQuality: 50, maxWidth: 720, maxHeight: 720);
 
       proImageFile1 = pickedFile?.path;
       pickImage = false;

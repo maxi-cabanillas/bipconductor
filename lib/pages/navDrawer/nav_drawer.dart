@@ -24,6 +24,7 @@ import '../NavigatorPages/walletpage.dart';
 import '../login/landingpage.dart';
 import '../login/login.dart';
 import '../onTripPage/map_page.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 
 class NavDrawer extends StatefulWidget {
   const NavDrawer({super.key});
@@ -118,8 +119,7 @@ class _NavDrawerState extends State<NavDrawer> {
                                 decoration: BoxDecoration(
                                     borderRadius: BorderRadius.circular(8),
                                     image: DecorationImage(
-                                        image: NetworkImage(
-                                            userDetails['profile_picture']),
+                                        image: CachedNetworkImageProvider(userDetails['profile_picture'].toString()),
                                         fit: BoxFit.cover)),
                               ),
                               SizedBox(

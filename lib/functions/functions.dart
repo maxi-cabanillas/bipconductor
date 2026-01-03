@@ -65,19 +65,14 @@ String url = 'https://bipp.com.ar/'; //add '/' at the end of the url as 'https:/
 // Prefer using --dart-define to avoid hardcoding secrets.
 // Example:
 //   flutter run --dart-define=MAPS_API_KEY_ANDROID=XXXX --dart-define=MAPS_API_KEY_IOS=YYYY
-const String _androidMapKey = String.fromEnvironment('MAPS_API_KEY_ANDROID');
-const String _iosMapKey = String.fromEnvironment('MAPS_API_KEY_IOS');
+//
+// IMPORTANT: Since this repo already contained a key, you should rotate/restrict it in Google Cloud Console.
+const String _fallbackAndroidMapKey = 'AIzaSyAoADgz4godD2rdNZNCDz3_pao7BJlxOTo';
+const String _fallbackIosMapKey = 'ios map key';
+const String _androidMapKey = String.fromEnvironment('MAPS_API_KEY_ANDROID', defaultValue: _fallbackAndroidMapKey);
+const String _iosMapKey = String.fromEnvironment('MAPS_API_KEY_IOS', defaultValue: _fallbackIosMapKey);
 
 String mapkey = Platform.isAndroid ? _androidMapKey : _iosMapKey;
-
-// UI notifier throttle (prevents rebuild spam on fast GPS / streams)
-DateTime _lastHomeNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
-void notifyHomeThrottled([Duration minInterval = const Duration(milliseconds: 250)]) {
-  final now = DateTime.now();
-  if (now.difference(_lastHomeNotifyAt) < minInterval) return;
-  _lastHomeNotifyAt = now;
-  notifyHomeThrottled();
-}
 
 String mapStyle = '';
 String mapType = '';
@@ -132,7 +127,7 @@ getDetailsOfDevice() async {
     // Sync polyline (Google Maps) desde polyList — una sola polyline, sin duplicados
     syncGooglePolylineFromPolyList();
     if (mapType == 'google') {
-      notifyHomeThrottled();
+      valueNotifierHome.incrementNotifier();
     }
   } catch (e) {
     debugPrint(e.toString());
@@ -1781,6 +1776,19 @@ ValueNotifyingTimer valueNotifierTimer = ValueNotifyingTimer();
 ValueNotifyingLogin valueNotifierLogin = ValueNotifyingLogin();
 ValueNotifyingChat valueNotifierChat = ValueNotifyingChat();
 
+
+// --- UI notify throttle (avoid jank) ---
+DateTime _lastHomeNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
+void notifyHomeThrottled([Duration minInterval = const Duration(milliseconds: 250)]) {
+  final now = DateTime.now();
+  if (now.difference(_lastHomeNotifyAt) < minInterval) return;
+  _lastHomeNotifyAt = now;
+  valueNotifierHome.incrementNotifier();
+}
+
+// --- GPS update timer handle (allow cancel) ---
+Timer? _positionUpdateTimer;
+
 //driver online offline status
 driverStatus() async {
   dynamic result;
@@ -1837,7 +1845,9 @@ currentPositionUpdate() async {
   geolocs.LocationPermission permission;
   GeoHasher geo = GeoHasher();
 
-  Timer.periodic(const Duration(seconds: 5), (timer) async {
+  _positionUpdateTimer?.cancel();
+
+  _positionUpdateTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
     final tickNow = DateTime.now();
     if (userDetails.isNotEmpty && userDetails['role'] == 'driver') {
       serviceEnabled =
@@ -1886,7 +1896,8 @@ currentPositionUpdate() async {
           };
 
           // Push static/meta fields only when they change (or every 5 minutes as a safety refresh)
-          final metaHash = "${userDetails['mobile']}|${userDetails['name']}|${userDetails['profile_picture']}|${userDetails['rating']}|${userDetails['vehicle_type_icon_for']}|${userDetails['car_number']}|${userDetails['car_make_name']}|${userDetails['vehicle_type_id']}|${userDetails['vehicle_types']}|${userDetails['owner_id']}|${userDetails['service_location_id']}|${userDetails['transport_type']}";
+          final metaHash =
+              '${userDetails['mobile']}|${userDetails['name']}|${userDetails['profile_picture']}|${userDetails['rating']}|${userDetails['vehicle_type_icon_for']}|${userDetails['car_number']}|${userDetails['car_make_name']}|${userDetails['vehicle_type_id']}|${userDetails['vehicle_types']}|${userDetails['owner_id']}|${userDetails['service_location_id']}|${userDetails['transport_type']}';
 
           final shouldPushMeta = _lastDriverMetaHash != metaHash ||
               _lastDriverMetaPushAt == null ||
@@ -1934,11 +1945,11 @@ currentPositionUpdate() async {
             }
           }
 
-          notifyHomeThrottled();
+          valueNotifierHome.incrementNotifier();
         } catch (e) {
           if (e is SocketException) {
             internet = false;
-            notifyHomeThrottled();
+            valueNotifierHome.incrementNotifier();
           }
         }
       } else if (userDetails['active'] == false &&
@@ -1968,12 +1979,12 @@ currentPositionUpdate() async {
             if (userDetails['active'] == true) {
               await driverStatus();
             }
-            notifyHomeThrottled();
+            valueNotifierHome.incrementNotifier();
             //audioPlayer.play(audio);
           } else if (driverState.child('approve').value == 1 &&
               userDetails['approve'] == false) {
             await getUserDetails();
-            notifyHomeThrottled();
+            valueNotifierHome.incrementNotifier();
 
             //audioPlayer.play(audio);
           }
@@ -1983,7 +1994,7 @@ currentPositionUpdate() async {
                 .child('drivers/driver_${userDetails['id']}')
                 .update({'fleet_changed': 0});
             await getUserDetails();
-            notifyHomeThrottled();
+            valueNotifierHome.incrementNotifier();
 
             //audioPlayer.play(audio);
           }
@@ -1993,7 +2004,7 @@ currentPositionUpdate() async {
                 .child('drivers/driver_${userDetails['id']}')
                 .remove();
             await getUserDetails();
-            notifyHomeThrottled();
+            valueNotifierHome.incrementNotifier();
           }
           if (driverState.key!.contains('vehicle_type_icon')) {
             if (driverState.child('vehicle_type_icon') !=
@@ -2022,12 +2033,12 @@ currentPositionUpdate() async {
           userDetails['approve'] == true) {
         await getUserDetails();
 
-        notifyHomeThrottled();
+        valueNotifierHome.incrementNotifier();
       } else if (ownerStatus.child('approve').value == 1 &&
           userDetails['approve'] == false) {
         await getUserDetails();
       }
-      notifyHomeThrottled();
+      valueNotifierHome.incrementNotifier();
     }
   });
 }
@@ -5073,9 +5084,11 @@ streamRide() {
   });
 }
 
-dynamic chatStream;
+StreamSubscription<DatabaseEvent>? chatStream;
 String unSeenChatCount = '0';
 streamAdminchat() async {
+  
+  await chatStream?.cancel();
   chatStream = FirebaseDatabase.instance
       .ref()
       .child(
