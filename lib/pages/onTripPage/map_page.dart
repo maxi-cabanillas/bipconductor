@@ -1209,9 +1209,6 @@ class _MapsState extends State<Maps>
   void _updateDriverMarker(LatLng latLng, double newHeading) {
     try {
       myMarkers.removeWhere((m) => m.markerId.value == '1');
-
-      final snappedLatLng = _snapToRouteIfPossible(latLng);
-
       final icon = (userDetails['vehicle_type_icon_for'] == 'motor_bike')
           ? pinLocationIcon3
           : (userDetails['vehicle_type_icon_for'] == 'taxi')
@@ -1221,7 +1218,7 @@ class _MapsState extends State<Maps>
       myMarkers.add(
         Marker(
           markerId: const MarkerId('1'),
-          position: snappedLatLng,
+          position: latLng,
           icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
               ? _driverGoogleArrowIcon!
               : icon,
@@ -1239,7 +1236,7 @@ class _MapsState extends State<Maps>
     final targetLatLng = _snapToRouteIfPossible(latLng);
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 70) {
+        now.difference(_lastCameraMove!).inMilliseconds < 150) {
       return; // throttle camera work
     }
     _lastCameraMove = now;
@@ -1547,15 +1544,10 @@ class _MapsState extends State<Maps>
     // When following + bearing mode, align marker to camera bearing so it stays "up"
     final markerHeading = (_followDriver && _followBearing) ? _cameraBearing : headingDeg;
     // Throttle marker updates to keep the map smooth and avoid buffer queue overflow
-    if (nowUi.difference(_lastMarkerUiAt).inMilliseconds >= 40) {
+    if (nowUi.difference(_lastMarkerUiAt).inMilliseconds >= 70) {
       _lastMarkerUiAt = nowUi;
       _updateDriverMarker(latLng, markerHeading);
     }
-
-    // Keep the polyline head in sync with the (snapped) moving vehicle so
-    // the route line doesn't appear ahead/behind the arrow.
-    final driverOnRoute = _snapToRouteIfPossible(latLng);
-    // NOTE: dejamos la polyline estable (sin recortes) para evitar “doble polyline”, parpadeos y saltos.
   }
 
 
@@ -2318,7 +2310,7 @@ class _MapsState extends State<Maps>
                           .longitude,
                       center.latitude,
                       center.longitude);
-                  if (dist > 0 &&
+                  if (userDetails['role'] != 'driver' && dist > 0 &&
                       animationController == null &&
                       (_controller != null || mapType != 'google')) {
                     animationController = AnimationController(
