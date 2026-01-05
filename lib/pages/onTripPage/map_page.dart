@@ -109,6 +109,27 @@ class _MapsState extends State<Maps>
   bool _followBearing = true; // false when user moves the map manually
   double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
+
+  // --- Follow pause/resume (user gestures) ---
+  Timer? _followResumeTimer;
+  DateTime _lastUserMapGestureAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastProgrammaticCamAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // --- Smooth driver pose rendering (frame interpolation between GPS fixes) ---
+  AnimationController? _driverSmoothCtrl;
+  LatLng? _smoothFromLatLng;
+  LatLng? _smoothToLatLng;
+  double _smoothFromHeading = 0.0;
+  double _smoothToHeading = 0.0;
+  LatLng? _renderDriverLatLng;
+  double _renderDriverHeading = 0.0;
+  DateTime _lastGpsFixAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastSmoothFrameAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // --- Route update decouple (no UI blocking) ---
+  Timer? _routeDebounceTimer;
+  bool _routeUpdateInFlight = false;
+  DateTime _lastRouteUpdateAt = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastCameraMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _prevDriverLatLng;
 
@@ -698,19 +719,14 @@ class _MapsState extends State<Maps>
             currentLocation = latLng;
             heading = newHeading;
 
-            // 🔁 Recalcular y redibujar la ruta en cada update de GPS
+            // 🔁 Recalcular/redibujar ruta sin bloquear el tracking en UI
             // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
             if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
-              await handleRouteDeviationAndSnap(offRouteMeters: 50);
+              _requestRouteUpdateDebounced();
             }
 
-            // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
-
-            _updateDriverMarker(latLng, newHeading);
-
-            if (_followDriver) {
-              _animateToDriver(latLng, newHeading);
-            }
+            // UI tracking: flecha fluida (tipo Google Maps)
+            _startOrUpdateSmoothDriver(latLng, newHeading);
 
             valueNotifierHome.incrementNotifier();
           });
@@ -937,7 +953,7 @@ class _MapsState extends State<Maps>
 
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 250) {
+        now.difference(_lastCameraMove!).inMilliseconds < 80) {
       return; // throttle camera work
     }
     _lastCameraMove = now;
@@ -972,6 +988,8 @@ class _MapsState extends State<Maps>
       zoom: _currentZoom,
       bearing: bearingToApply,
     );
+
+    _lastProgrammaticCamAt = now;
 
     if (useMoveCamera) {
       _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
@@ -1016,6 +1034,137 @@ class _MapsState extends State<Maps>
 
 
 
+
+  // --- Follow pause/resume: keep centered always, pause 10s on user gestures ---
+  void _pauseFollowForUserGesture([Duration duration = const Duration(seconds: 10)]) {
+    _lastUserMapGestureAt = DateTime.now();
+
+    if (_followDriver) {
+      setState(() => _followDriver = false);
+    }
+
+    _followResumeTimer?.cancel();
+    _followResumeTimer = Timer(duration, _maybeResumeFollow);
+  }
+
+  void _maybeResumeFollow() {
+    if (!mounted) return;
+    const duration = Duration(seconds: 10);
+    final since = DateTime.now().difference(_lastUserMapGestureAt);
+
+    if (since >= duration) {
+      if (!_followDriver) {
+        setState(() => _followDriver = true);
+      }
+    } else {
+      // User kept moving the map: wait remaining time.
+      _followResumeTimer?.cancel();
+      _followResumeTimer = Timer(duration - since, _maybeResumeFollow);
+    }
+  }
+
+  // --- Decouple route updates from GPS stream (avoid blocking marker/camera updates) ---
+  void _requestRouteUpdateDebounced() {
+    _routeDebounceTimer?.cancel();
+    _routeDebounceTimer = Timer(const Duration(milliseconds: 700), () {
+      if (!mounted) return;
+      final now = DateTime.now();
+
+      if (_routeUpdateInFlight) return;
+      if (now.difference(_lastRouteUpdateAt).inMilliseconds < 1200) return;
+
+      _routeUpdateInFlight = true;
+      _lastRouteUpdateAt = now;
+
+      handleRouteDeviationAndSnap(offRouteMeters: 50)
+          .catchError((_) {})
+          .whenComplete(() {
+        _routeUpdateInFlight = false;
+      });
+    });
+  }
+
+  // --- Smooth pose updates for driver marker (frame interpolation) ---
+  void _startOrUpdateSmoothDriver(LatLng to, double toHeading) {
+    final now = DateTime.now();
+
+    // First fix: apply immediately.
+    if (_renderDriverLatLng == null) {
+      _renderDriverLatLng = to;
+      _renderDriverHeading = toHeading;
+      _applyDriverPose(_renderDriverLatLng!, _renderDriverHeading);
+      _lastGpsFixAt = now;
+      return;
+    }
+
+    _smoothFromLatLng = _renderDriverLatLng;
+    _smoothToLatLng = to;
+    _smoothFromHeading = _renderDriverHeading;
+    _smoothToHeading = toHeading;
+
+    // Duration based on time between fixes (clamped)
+    final ms = now.difference(_lastGpsFixAt).inMilliseconds;
+    _lastGpsFixAt = now;
+    final durMs = ms.clamp(120, 420);
+    final duration = Duration(milliseconds: durMs);
+
+    _driverSmoothCtrl?.stop();
+    _driverSmoothCtrl?.dispose();
+    _driverSmoothCtrl = AnimationController(vsync: this, duration: duration);
+
+    _lastSmoothFrameAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+    _driverSmoothCtrl!.addListener(() {
+      if (!mounted) return;
+
+      // Limit rebuild rate a bit (≈30fps) to save battery
+      final n = DateTime.now();
+      if (_lastSmoothFrameAt.millisecondsSinceEpoch != 0 &&
+          n.difference(_lastSmoothFrameAt).inMilliseconds < 33) {
+        return;
+      }
+      _lastSmoothFrameAt = n;
+
+      final t = _driverSmoothCtrl!.value;
+
+      final from = _smoothFromLatLng!;
+      final toPos = _smoothToLatLng!;
+
+      final lat = ui.lerpDouble(from.latitude, toPos.latitude, t)!;
+      final lng = ui.lerpDouble(from.longitude, toPos.longitude, t)!;
+
+      final delta = _shortestAngleDelta(_smoothFromHeading, _smoothToHeading);
+      final head = _wrap360(_smoothFromHeading + delta * t);
+
+      _renderDriverLatLng = LatLng(lat, lng);
+      _renderDriverHeading = head;
+
+      _applyDriverPose(_renderDriverLatLng!, _renderDriverHeading);
+    });
+
+    _driverSmoothCtrl!.addStatusListener((s) {
+      if (!mounted) return;
+      if (s == AnimationStatus.completed || s == AnimationStatus.dismissed) {
+        _renderDriverLatLng = to;
+        _renderDriverHeading = toHeading;
+      }
+    });
+
+    _driverSmoothCtrl!.forward(from: 0);
+  }
+
+  void _applyDriverPose(LatLng latLng, double headingDeg) {
+    // Update camera first (keeps map centered + "arrow up" feeling)
+    if (_followDriver) {
+      _animateToDriver(latLng, headingDeg);
+    }
+
+    // When following + bearing mode, align marker to camera bearing so it stays "up"
+    final markerHeading = (_followDriver && _followBearing) ? _cameraBearing : headingDeg;
+    _updateDriverMarker(latLng, markerHeading);
+  }
+
+
   @override
   void dispose() {
     _setKeepScreenOn(false);
@@ -1031,6 +1180,10 @@ class _MapsState extends State<Maps>
 
     _bippSearchingCtrl.dispose();
     _bippLaserCtrl.dispose();
+
+    _followResumeTimer?.cancel();
+    _routeDebounceTimer?.cancel();
+    _driverSmoothCtrl?.dispose();
 
     super.dispose();
   }
@@ -3035,6 +3188,17 @@ class _MapsState extends State<Maps>
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
+                                                  onCameraMoveStarted: () {
+                                                    final now = DateTime.now();
+                                                    // Ignore camera moves triggered by our own animate/moveCamera.
+                                                    if (now.difference(_lastProgrammaticCamAt).inMilliseconds < 350) return;
+                                                    _pauseFollowForUserGesture(const Duration(seconds: 10));
+                                                  },
+                                                  onCameraMove: (pos) {
+                                                    final now = DateTime.now();
+                                                    if (now.difference(_lastProgrammaticCamAt).inMilliseconds < 350) return;
+                                                    _lastUserMapGestureAt = now;
+                                                  },
                                                   initialCameraPosition:
                                                   CameraPosition(
                                                     target: (center ==
@@ -3082,10 +3246,16 @@ class _MapsState extends State<Maps>
                                                       mapController:
                                                       _fmController,
                                                       options: fm.MapOptions(
-                                                          initialCenter:
-                                                          fmlt.LatLng(center.latitude, center.longitude),
-                                                          initialZoom: 16,
-                                                          onTap: (P, L) {}),
+                                                        initialCenter:
+                                                        fmlt.LatLng(center.latitude, center.longitude),
+                                                        initialZoom: 16,
+                                                        onTap: (P, L) {},
+                                                        onPositionChanged: (pos, hasGesture) {
+                                                          if (hasGesture) {
+                                                            _pauseFollowForUserGesture(const Duration(seconds: 10));
+                                                          }
+                                                        },
+                                                      ),
                                                       children: [
                                                         fm.TileLayer(
                                                           // minZoom: 10,
@@ -9094,17 +9264,20 @@ class _MapsState extends State<Maps>
 
         LatLng newPos = LatLng(lat, lng);
 
-        // Seguir automáticamente al vehículo en Google Maps
-        if (mapType == 'google' && _controller != null) {
+        // Seguir automáticamente al vehículo en Google Maps (modo navegación tipo Google Maps)
+        // Queremos: flecha "hacia arriba" => cámara rota con el bearing.
+        // Importante: usar moveCamera (no animateCamera) para evitar lag / cola de animaciones.
+        if (mapType == 'google' && _controller != null && _followDriver) {
           try {
-            _controller!.animateCamera(
-              CameraUpdate.newCameraPosition(
-                CameraPosition(
-                  target: newPos,
-                  zoom: 18.0,
-                ),
-              ),
+            final desiredBearing = _followBearing ? _wrap360(bearing) : 0.0;
+            final cam = CameraPosition(
+              target: newPos,
+              zoom: 18.0,
+              bearing: desiredBearing,
             );
+            _lastProgrammaticCamAt = DateTime.now();
+            _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+            _cameraBearing = desiredBearing;
           } catch (_) {}
         }
 

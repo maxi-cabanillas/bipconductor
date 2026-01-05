@@ -84,6 +84,22 @@ DateTime? _lastDriverMetaPushAt;
 String _lastDriverMetaHash = '';
 DateTime? _lastDriverStateCheckAt;
 
+// ---------------------------------------------------------------------------
+// HTTP timeouts (avoid hanging requests)
+// ---------------------------------------------------------------------------
+const Duration kHttpTimeout = Duration(seconds: 15);
+const Duration kOsrmTimeout = Duration(seconds: 8);
+
+// ---------------------------------------------------------------------------
+// Realtime DB location throttling (reduce battery/data/cost)
+// ---------------------------------------------------------------------------
+DateTime? _lastDriverLocPushAt;
+double? _lastDriverLocLat;
+double? _lastDriverLocLng;
+
+const Duration kFirebaseLocMinInterval = Duration(seconds: 8);
+const double kFirebaseLocMinMeters = 15.0;
+
 /// Mantiene UNA sola polyline en Google Maps, tomada desde `polyList`.
 /// Esto evita que aparezcan rutas duplicadas o con colores distintos (morada/azul).
 void syncGooglePolylineFromPolyList() {
@@ -153,7 +169,7 @@ validateEmail(email) async {
           "role": userDetails.isNotEmpty
               ? userDetails['role'].toString()
               : ischeckownerordriver
-        });
+        }).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'success';
@@ -191,7 +207,7 @@ getlangid() async {
         headers: {
           'Authorization': 'Bearer ${bearerToken[0].token}',
         },
-        body: jsonEncode({'lang': choosenLanguage}));
+        body: jsonEncode({'lang': choosenLanguage})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'success';
@@ -304,7 +320,7 @@ uploadDocs() async {
 
     response.fields['document_id'] = docsId.toString();
 
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
 
     var respon = await http.Response.fromStream(request);
 
@@ -355,7 +371,7 @@ uploadFleetDocs(fleetid) async {
     response.fields['fleet_id'] = fleetid.toString();
 
     response.fields['document_id'] = fleetdocsId.toString();
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
 
     final val = jsonDecode(respon.body);
@@ -391,7 +407,7 @@ List countries = [];
 getCountryCode() async {
   dynamic result;
   try {
-    final response = await http.get(Uri.parse('${url}api/v1/countries-new'));
+    final response = await http.get(Uri.parse('${url}api/v1/countries-new')).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       countries = jsonDecode(response.body)['data']['countries']['data'];
@@ -585,7 +601,7 @@ getServiceLocation() async {
   try {
     final response = await http.get(
       Uri.parse('${url}api/v1/servicelocation'),
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       serviceLocations = jsonDecode(response.body)['data'];
@@ -614,7 +630,7 @@ getvehicleType() async {
     final http.Response response = await http.get(
       Uri.parse(
           '${url}api/v1/types/$myServiceId?transport_type=$transportType'),
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       vehicleType = jsonDecode(response.body)['data'];
@@ -651,7 +667,7 @@ getVehicleMake({transportType, myVehicleIconFor}) async {
     final response = await http.get(
       Uri.parse(
           '${url}api/v1/common/car/makes?transport_type=$transportType&vehicle_type=$myVehicleIconFor'),
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       vehicleMake = jsonDecode(response.body)['data'];
@@ -686,7 +702,7 @@ getVehicleModel() async {
   try {
     final response = await http.get(
       Uri.parse('${url}api/v1/common/car/models/${vehicleMakeId.toString()}'),
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       vehicleModel = jsonDecode(response.body)['data'];
@@ -762,7 +778,7 @@ registerDriver() async {
             ? 'others'
             : '',
     });
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
 
     if (request.statusCode == 200) {
@@ -823,7 +839,7 @@ addDriver() async {
           "car_number": vehicleNumber,
           'custom_make': mycustommake,
           'custom_model': mycustommodel
-        }));
+        })).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       result = 'true';
@@ -892,7 +908,7 @@ registerOwner() async {
             ? 'others'
             : '',
     });
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
 
     if (respon.statusCode == 200) {
@@ -947,7 +963,7 @@ fleetDriverDetails({fleetid, bool? isassigndriver}) async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json',
       },
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       fleetdriverList = jsonDecode(response.body)['data'];
@@ -977,7 +993,7 @@ assignDriver(driverid, fleet) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'driver_id': driverid}));
+        body: jsonEncode({'driver_id': driverid})).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       var jsonVal = jsonDecode(response.body);
@@ -1020,7 +1036,7 @@ getnotificationHistory() async {
   try {
     var response = await http.get(
         Uri.parse('${url}api/v1/notifications/get-notification'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       notificationHistory = jsonDecode(response.body)['data'];
       notificationHistoryPage = jsonDecode(response.body)['meta'];
@@ -1051,7 +1067,7 @@ getNotificationPages(id) async {
   try {
     var response = await http.get(
         Uri.parse('${url}api/v1/notifications/get-notification?$id'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       List list = jsonDecode(response.body)['data'];
       // ignore: avoid_function_literals_in_foreach_calls
@@ -1087,7 +1103,7 @@ deleteNotification(id) async {
   try {
     var response = await http.get(
         Uri.parse('${url}api/v1/notifications/delete-notification/$id'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       valueNotifierHome.incrementNotifier();
@@ -1118,7 +1134,7 @@ sharewalletfun({mobile, role, amount}) async {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ${bearerToken[0].token}',
         },
-        body: jsonEncode({'mobile': mobile, 'role': role, 'amount': amount}));
+        body: jsonEncode({'mobile': mobile, 'role': role, 'amount': amount})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'success';
@@ -1150,7 +1166,7 @@ fleetDriver(Map<String, dynamic> map) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode(map));
+        body: jsonEncode(map)).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       var jsonVal = jsonDecode(response.body);
@@ -1194,7 +1210,7 @@ updateReferral(referral) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({"refferal_code": referral}));
+        body: jsonEncode({"refferal_code": referral})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'true';
@@ -1262,7 +1278,7 @@ getFleetDocumentsNeeded(fleetid) async {
         headers: {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
-        });
+        }).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       fleetdocumentsNeeded = jsonDecode(response.body)['data'];
       enablefleetDocumentSubmit =
@@ -1313,7 +1329,7 @@ verifyUser(String number, int login, String password, String email, isOtp,
             ? {"mobile": number, "email": email, "role": ischeckownerordriver}
             : (login == 0)
             ? {"mobile": number, "role": ischeckownerordriver}
-            : {"email": number, "role": ischeckownerordriver});
+            : {"email": number, "role": ischeckownerordriver}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       val = jsonDecode(response.body)['success'];
       if (val == true) {
@@ -1438,7 +1454,7 @@ driverLogin(number, login, password, isOtp) async {
               ? 'android'
               : 'ios',
           "role": ischeckownerordriver,
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       var jsonVal = jsonDecode(response.body);
       if (ischeckownerordriver == 'driver' && Platform.isAndroid) {
@@ -1502,7 +1518,7 @@ getUserDetails() async {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ${bearerToken[0].token}'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       userDetails = jsonDecode(response.body)['data'];
       if (userDetails['notifications_count'] != 0 &&
@@ -1795,7 +1811,7 @@ driverStatus() async {
   try {
     var response = await http.post(
         Uri.parse('${url}api/v1/driver/online-offline'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       userDetails = jsonDecode(response.body)['data'];
       result = true;
@@ -1924,9 +1940,34 @@ currentPositionUpdate() async {
             _lastDriverMetaPushAt = tickNow;
           }
 
-          await firebase
-              .child('drivers/driver_${userDetails['id']}')
-              .update(payload);
+          final latNow = center.latitude;
+          final lngNow = center.longitude;
+
+          final bool movedEnough = (_lastDriverLocLat == null || _lastDriverLocLng == null)
+              ? true
+              : geolocs.Geolocator.distanceBetween(
+            _lastDriverLocLat!,
+            _lastDriverLocLng!,
+            latNow,
+            lngNow,
+          ) >= kFirebaseLocMinMeters;
+
+          final bool timeEnough = (_lastDriverLocPushAt == null)
+              ? true
+              : tickNow.difference(_lastDriverLocPushAt!) >= kFirebaseLocMinInterval;
+
+          final bool shouldWriteLoc = movedEnough || timeEnough;
+          final bool shouldWrite = shouldWriteLoc || shouldPushMeta;
+
+          if (shouldWrite) {
+            await firebase
+                .child('drivers/driver_${userDetails['id']}')
+                .update(payload);
+
+            _lastDriverLocPushAt = tickNow;
+            _lastDriverLocLat = latNow;
+            _lastDriverLocLng = lngNow;
+          }
           if (driverReq.isNotEmpty) {
             if (driverReq['accepted_at'] != null &&
                 driverReq['is_completed'] == 0) {
@@ -2169,7 +2210,7 @@ requestAccept() async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'request_id': driverReq['id'], 'is_accept': 1}));
+        body: jsonEncode({'request_id': driverReq['id'], 'is_accept': 1})).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       // FirebaseDatabase.instance.ref('request-meta/${driverReq['id']}').remove();
@@ -2248,7 +2289,7 @@ requestReject() async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'request_id': driverReq['id'], 'is_accept': 0}));
+        body: jsonEncode({'request_id': driverReq['id'], 'is_accept': 0})).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       requestStreamEnd?.cancel();
@@ -2344,7 +2385,7 @@ driverArrived() async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'request_id': driverReq['id']}));
+        body: jsonEncode({'request_id': driverReq['id']})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       polyline.clear();
       fmpoly.clear();
@@ -2386,7 +2427,7 @@ stopComplete(id) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'stop_id': id}));
+        body: jsonEncode({'stop_id': id})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
     } else if (response.statusCode == 401) {
@@ -2450,7 +2491,7 @@ tripStart() async {
           'pick_lat': driverReq['pick_lat'],
           'pick_lng': driverReq['pick_lng'],
           'ride_otp': driverOtp
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       await getUserDetails();
@@ -2483,7 +2524,7 @@ readyToPickup(requestid) async {
         },
         body: jsonEncode({
           'request_id': requestid,
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       await getUserDetails();
@@ -2518,7 +2559,7 @@ tripStartDispatcher() async {
           'request_id': driverReq['id'],
           'pick_lat': driverReq['pick_lat'],
           'pick_lng': driverReq['pick_lng']
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       await getUserDetails();
@@ -2587,7 +2628,7 @@ etaRequest() async {
           'drop_lng':
           addressList.firstWhere((e) => e.type == 'drop').latlng.longitude,
           'ride_type': 1
-        }));
+        })).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       etaDetails = jsonDecode(response.body)['data'];
@@ -2623,7 +2664,7 @@ geoCodingForLatLng(id, sessionToken) async {
           if (Platform.isAndroid) 'X-Android-Package': packageName,
           if (Platform.isAndroid) 'X-Android-Cert': signKey,
           if (Platform.isIOS) 'X-IOS-Bundle-Identifier': packageName,
-        });
+        }).timeout(kHttpTimeout);
     if (val.statusCode == 200) {
       // var result = jsonDecode(val.body)['result']['geometry']['location'];
       var value = jsonDecode(val.body);
@@ -2669,7 +2710,7 @@ createRequest(name, phone) async {
           'mobile': phone,
           'poly_line': polyString,
           'request_eta_amount': etaDetails['total'].toString()
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       // await getUserDetails();
       result = 'success';
@@ -2720,7 +2761,7 @@ createRequestDelivery(name, phone) async {
           'request_eta_amount': etaDetails['total'].toString(),
           'goods_type_id': selectedGoodsId,
           'goods_type_quantity': goodsSize
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       // await getUserDetails();
       result = 'success';
@@ -2747,7 +2788,7 @@ getGoodsList() async {
   dynamic result;
   goodsTypeList.clear();
   try {
-    var response = await http.get(Uri.parse('${url}api/v1/common/goods-types'));
+    var response = await http.get(Uri.parse('${url}api/v1/common/goods-types')).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       goodsTypeList = jsonDecode(response.body)['data'];
       valueNotifierHome.incrementNotifier();
@@ -2796,7 +2837,7 @@ getAutocomplete(input, sessionToken, lat, lng) async {
           if (Platform.isAndroid) 'X-Android-Cert': signKey,
           if (Platform.isIOS) 'X-IOS-Bundle-Identifier': packageName,
         },
-      );
+      ).timeout(kHttpTimeout);
       if (val.statusCode == 200) {
         var result = jsonDecode(val.body);
         for (var element in result['suggestions']) {
@@ -2823,7 +2864,7 @@ getAutocomplete(input, sessionToken, lat, lng) async {
       pref.setString('autoAddress', jsonEncode(storedAutoAddress).toString());
     } else {
       var result = await http.get(Uri.parse(
-          'https://nominatim.openstreetmap.org/search?q=$input&format=json'));
+          'https://nominatim.openstreetmap.org/search?q=$input&format=json')).timeout(kHttpTimeout);
       for (var element in jsonDecode(result.body)) {
         addAutoFill.add({
           'place': element['place_id'],
@@ -2853,18 +2894,18 @@ geoCoding(double lat, double lng) async {
             headers: {
               'X-Android-Package': packageName,
               'X-Android-Cert': signKey
-            });
+            }).timeout(kHttpTimeout);
       } else {
         val = await http.get(
             Uri.parse(
                 'https://maps.googleapis.com/maps/api/geocode/json?latlng=$lat,$lng&key=$mapkey'),
-            headers: {'X-IOS-Bundle-Identifier': packageName});
+            headers: {'X-IOS-Bundle-Identifier': packageName}).timeout(kHttpTimeout);
       }
     } else {
       val = await http.get(
         Uri.parse(
             'https://nominatim.openstreetmap.org/reverse?lat=$lat&lon=$lng&format=json'),
-      );
+      ).timeout(kHttpTimeout);
     }
     if (val.statusCode == 200) {
       if (mapType == 'google') {
@@ -2935,7 +2976,7 @@ endTrip() async {
               driverReq['is_rental'] != true)
               ? (waitingAfterTime / 60).toInt()
               : 0
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getUserDetails();
       FirebaseDatabase.instance.ref('requests').child(reqId).update(
@@ -2984,7 +3025,7 @@ uploadSignatureImage() async {
         await http.MultipartFile.fromPath('proof_image', signatureFile.path));
     response.fields['after_unload'] = '1';
     response.fields['request_id'] = driverReq['id'];
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
     final val = jsonDecode(respon.body);
     if (request.statusCode == 200) {
@@ -3080,7 +3121,7 @@ getPolylines(animate) async {
               if (Platform.isAndroid) 'X-Android-Cert': signKey,
               if (Platform.isIOS) 'X-IOS-Bundle-Identifier': packageName,
             },
-          );
+          ).timeout(kHttpTimeout);
 
           if (value.statusCode == 200) {
             var steps = jsonDecode(value.body)['routes'][0]['polyline']
@@ -3149,7 +3190,7 @@ getPolylines(animate) async {
             if (Platform.isAndroid) 'X-Android-Cert': signKey,
             if (Platform.isIOS) 'X-IOS-Bundle-Identifier': packageName,
           },
-        );
+        ).timeout(kHttpTimeout);
 
         if (value.statusCode == 200) {
           var steps = jsonDecode(value.body)['routes'][0]['polyline']
@@ -3287,7 +3328,7 @@ Future<void> rebuildRoutePolylinesFromCurrent() async {
           'X-Android-Cert': signKey,
         },
         body: jsonEncode(requestBody),
-      );
+      ).timeout(kHttpTimeout);
 
       if (resp.statusCode == 200) {
         final decoded = jsonDecode(resp.body);
@@ -3415,7 +3456,7 @@ userRating() async {
           'request_id': driverReq['id'],
           'rating': review,
           'comment': feedback
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       FirebaseDatabase.instance
           .ref()
@@ -3461,7 +3502,7 @@ cancelRequestDriver(reason) async {
           'Content-Type': 'application/json'
         },
         body: jsonEncode(
-            {'request_id': driverReq['id'], 'custom_reason': reason}));
+            {'request_id': driverReq['id'], 'custom_reason': reason})).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
@@ -3507,7 +3548,7 @@ getCurrentMessages() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         if (chatList.where((element) => element['from_type'] == 1).length !=
@@ -3546,7 +3587,7 @@ sendMessage(chat) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'request_id': driverReq['id'], 'message': chat}));
+        body: jsonEncode({'request_id': driverReq['id'], 'message': chat})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       getCurrentMessages();
       FirebaseDatabase.instance
@@ -3575,7 +3616,7 @@ messageSeen() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-      body: jsonEncode({'request_id': driverReq['id']}));
+      body: jsonEncode({'request_id': driverReq['id']})).timeout(kHttpTimeout);
   if (response.statusCode == 200) {
     // getCurrentMessages();
   } else {
@@ -3595,7 +3636,7 @@ cancelReason(reason) async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json',
       },
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       cancelReasonsList = jsonDecode(response.body)['data'];
@@ -3644,7 +3685,7 @@ getVehicleInfo() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       vehicledata = jsonDecode(response.body)['data'];
@@ -3673,7 +3714,7 @@ deletefleetdriver(driverid) async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       FirebaseDatabase.instance
           .ref()
@@ -3717,7 +3758,7 @@ updateVehicle() async {
           "vehicle_year": modelYear,
           'custom_make': mycustommake,
           'custom_model': mycustommodel
-        }));
+        })).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       await getUserDetails();
@@ -3765,7 +3806,7 @@ updateProfile(name, email, usergender) async {
           ? 'others'
           : '';
     }
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
     final val = jsonDecode(respon.body);
     if (request.statusCode == 200) {
@@ -3816,7 +3857,7 @@ updateProfileWithoutImage(name, email, usergender) async {
           ? 'others'
           : '';
     }
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
     final val = jsonDecode(respon.body);
     if (request.statusCode == 200) {
@@ -3885,7 +3926,7 @@ getFaqPages(id) async {
     await http.get(Uri.parse('${url}api/v1/common/faq/list/$id'), headers: {
       'Authorization': 'Bearer ${bearerToken[0].token}',
       'Content-Type': 'application/json'
-    });
+    }).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       var val = jsonDecode(response.body)['data'];
       val.forEach((element) {
@@ -3919,7 +3960,7 @@ getHistory() async {
   try {
     var response = await http.get(
         Uri.parse('${url}api/v1/request/history?$historyFiltter'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       myHistory = jsonDecode(response.body)['data'];
@@ -3950,7 +3991,7 @@ getHistoryPages(id) async {
 
   try {
     var response = await http.get(Uri.parse('${url}api/v1/request/history?$id'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       List list = jsonDecode(response.body)['data'];
       // ignore: avoid_function_literals_in_foreach_calls
@@ -3991,7 +4032,7 @@ getWalletHistory() async {
   try {
     var response = await http.get(
         Uri.parse('${url}api/v1/payment/wallet/history'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       walletBalance = jsonDecode(response.body);
       walletHistory = walletBalance['wallet_history']['data'];
@@ -4025,7 +4066,7 @@ getWalletHistoryPage(page) async {
   try {
     var response = await http.get(
         Uri.parse('${url}api/v1/payment/wallet/history?page=$page'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       walletBalance = jsonDecode(response.body);
       List list = walletBalance['wallet_history']['data'];
@@ -4064,7 +4105,7 @@ addSos(name, number) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'name': name, 'number': number}));
+        body: jsonEncode({'name': name, 'number': number})).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       await getUserDetails();
@@ -4122,7 +4163,7 @@ getReferral() async {
     await http.get(Uri.parse('${url}api/v1/get/referral'), headers: {
       'Authorization': 'Bearer ${bearerToken[0].token}',
       'Content-Type': 'application/json'
-    });
+    }).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       myReferralCode = jsonDecode(response.body)['data'];
@@ -4155,7 +4196,7 @@ getStripePayment(money) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'amount': money}));
+        body: jsonEncode({'amount': money})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       results = 'success';
       stripeToken = jsonDecode(response.body)['data'];
@@ -4186,7 +4227,7 @@ addMoneyStripe(amount, nonce) async {
           'Content-Type': 'application/json'
         },
         body: jsonEncode(
-            {'amount': amount, 'payment_nonce': nonce, 'payment_id': nonce}));
+            {'amount': amount, 'payment_nonce': nonce, 'payment_id': nonce})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getWalletHistory();
       await getUserDetails();
@@ -4219,7 +4260,7 @@ getPaystackPayment(money) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'amount': money}));
+        body: jsonEncode({'amount': money})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['status'] == false) {
         results = jsonDecode(response.body)['message'];
@@ -4254,7 +4295,7 @@ addMoneyFlutterwave(amount, nonce) async {
           'Content-Type': 'application/json'
         },
         body: jsonEncode(
-            {'amount': amount, 'payment_nonce': nonce, 'payment_id': nonce}));
+            {'amount': amount, 'payment_nonce': nonce, 'payment_id': nonce})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getWalletHistory();
       await getUserDetails();
@@ -4286,7 +4327,7 @@ addMoneyRazorpay(amount, nonce) async {
           'Content-Type': 'application/json'
         },
         body: jsonEncode(
-            {'amount': amount, 'payment_nonce': nonce, 'payment_id': nonce}));
+            {'amount': amount, 'payment_nonce': nonce, 'payment_id': nonce})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getWalletHistory();
       await getUserDetails();
@@ -4321,7 +4362,7 @@ getCfToken(money, currency) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'order_amount': money, 'order_currency': currency}));
+        body: jsonEncode({'order_amount': money, 'order_currency': currency})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['status'] == 'OK') {
         cftToken = jsonDecode(response.body);
@@ -4365,7 +4406,7 @@ cashFreePaymentSuccess() async {
           'txMsg': cfSuccessList['txMsg'],
           'txTime': cfSuccessList['txTime'],
           'signature': cfSuccessList['signature']
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'success';
@@ -4400,7 +4441,7 @@ userLogout() async {
     var response = await http.post(Uri.parse('${url}api/v1/logout'), headers: {
       'Authorization': 'Bearer ${bearerToken[0].token}',
       'Content-Type': 'application/json'
-    });
+    }).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       // platforms.invokeMethod('logout');
       if (Platform.isAndroid) {
@@ -4476,7 +4517,7 @@ driverTodayEarning() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       driverTodayEarnings = jsonDecode(response.body)['data'];
@@ -4504,7 +4545,7 @@ driverWeeklyEarning() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       driverWeeklyEarnings = jsonDecode(response.body)['data'];
@@ -4533,7 +4574,7 @@ driverEarningReport(fromdate, todate) async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       driverReportEarnings = jsonDecode(response.body)['data'];
       result = 'success';
@@ -4563,7 +4604,7 @@ requestWithdraw(amount) async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json'
         },
-        body: jsonEncode({'requested_amount': amount}));
+        body: jsonEncode({'requested_amount': amount})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getWithdrawList();
       result = 'success';
@@ -4597,7 +4638,7 @@ getWithdrawList() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       withDrawList = jsonDecode(response.body);
       withDrawHistory = jsonDecode(response.body)['withdrawal_history']['data'];
@@ -4628,7 +4669,7 @@ getWithdrawListPages(page) async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       withDrawList = jsonDecode(response.body);
       List val = jsonDecode(response.body)['withdrawal_history']['data'];
@@ -4667,7 +4708,7 @@ getBankInfo() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
       bankData = jsonDecode(response.body)['data'];
@@ -4700,7 +4741,7 @@ addBankData(accName, accNo, bankCode, bankName) async {
           'account_no': accNo,
           'bank_code': bankCode,
           'bank_name': bankName
-        }));
+        })).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       await getBankInfo();
@@ -4761,7 +4802,7 @@ getGeneralComplaint(type) async {
       Uri.parse(
           '${url}api/v1/common/complaint-titles?complaint_type=$type&transport_type=${userDetails['transport_type']}'),
       headers: {'Authorization': 'Bearer ${bearerToken[0].token}'},
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       generalComplaintList = jsonDecode(response.body)['data'];
       result = 'success';
@@ -4792,7 +4833,7 @@ makeGeneralComplaint(complaintDesc) async {
         body: jsonEncode({
           'complaint_title_id': generalComplaintList[complaintType]['id'],
           'description': complaintDesc,
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
     } else if (response.statusCode == 401) {
@@ -4823,7 +4864,7 @@ makeRequestComplaint() async {
           'complaint_title_id': generalComplaintList[complaintType]['id'],
           'description': complaintDesc,
           'request_id': myHistory[selectedHistory]['id']
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       result = 'success';
     } else if (response.statusCode == 401) {
@@ -5128,7 +5169,7 @@ getadminCurrentMessages() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json'
       },
-    );
+    ).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       adminChatList.clear();
       isnewchat = jsonDecode(response.body)['data']['new_chat'];
@@ -5170,7 +5211,7 @@ sendadminMessage(chat) async {
           'new_chat': 0,
           'message': chat,
           'chat_id': chatid,
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       chatid = jsonDecode(response.body)['data']['chat_id'];
       adminChatList.add({
@@ -5210,7 +5251,7 @@ adminmessageseen() async {
         'Authorization': 'Bearer ${bearerToken[0].token}',
         'Content-Type': 'application/json',
       },
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       result = true;
@@ -5263,7 +5304,7 @@ uploadLoadingImage(image) async {
     response.files.add(await http.MultipartFile.fromPath('proof_image', image));
     response.fields['before_load'] = '1';
     response.fields['request_id'] = driverReq['id'];
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
     final val = jsonDecode(respon.body);
     if (request.statusCode == 200) {
@@ -5296,7 +5337,7 @@ uploadUnloadingImage(image) async {
     response.files.add(await http.MultipartFile.fromPath('proof_image', image));
     response.fields['after_load'] = '1';
     response.fields['request_id'] = driverReq['id'];
-    var request = await response.send();
+    var request = await response.send().timeout(kHttpTimeout);
     var respon = await http.Response.fromStream(request);
     final val = jsonDecode(respon.body);
     if (request.statusCode == 200) {
@@ -5375,7 +5416,7 @@ addHomeAddress(lat, lng, add) async {
           'my_route_lat': lat,
           'my_route_lng': lng,
           'my_route_address': add
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getUserDetails();
       result = 'success';
@@ -5415,7 +5456,7 @@ enableMyRouteBookings(lat, lng) async {
           'is_enable': (userDetails['enable_my_route_booking'] == 1) ? 0 : 1,
           'current_lat': lat,
           'current_lng': lng
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getUserDetails();
       result = 'success';
@@ -5601,7 +5642,7 @@ emailVerify(String email, otpNumber) async {
   dynamic val;
   try {
     var response = await http.post(Uri.parse('${url}api/v1/validate-email-otp'),
-        body: {"email": email, "otp": otpNumber});
+        body: {"email": email, "otp": otpNumber}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         val = 'success';
@@ -5637,7 +5678,7 @@ paymentReceived() async {
           'Authorization': 'Bearer ${bearerToken[0].token}',
           'Content-Type': 'application/json',
         },
-        body: jsonEncode({'request_id': driverReq['id']}));
+        body: jsonEncode({'request_id': driverReq['id']})).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       // userCancelled = true;
       FirebaseDatabase.instance
@@ -5672,7 +5713,7 @@ getOwnermodule() async {
   try {
     final response = await http.get(
       Uri.parse('${url}api/v1/common/modules'),
-    );
+    ).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       ownermodule = jsonDecode(response.body)['enable_owner_login'];
@@ -5700,7 +5741,7 @@ sendOTPtoMobile(String mobile, String countryCode) async {
   dynamic result;
   try {
     var response = await http.post(Uri.parse('${url}api/v1/mobile-otp'),
-        body: {'mobile': mobile, 'country_code': countryCode});
+        body: {'mobile': mobile, 'country_code': countryCode}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'success';
@@ -5731,7 +5772,7 @@ validateSmsOtp(String mobile, String otp) async {
   dynamic result;
   try {
     var response = await http.post(Uri.parse('${url}api/v1/validate-otp'),
-        body: {'mobile': mobile, 'otp': otp});
+        body: {'mobile': mobile, 'otp': otp}).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       if (jsonDecode(response.body)['success'] == true) {
         result = 'success';
@@ -5764,7 +5805,7 @@ outStationListFun() async {
   try {
     final response = await http.get(
         Uri.parse('${url}api/v1/request/outstation_rides'),
-        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'});
+        headers: {'Authorization': 'Bearer ${bearerToken[0].token}'}).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       outStationList = jsonDecode(response.body)['data'];
@@ -5794,7 +5835,7 @@ List loginImages = [];
 getLandingImages() async {
   dynamic result;
   try {
-    final response = await http.get(Uri.parse('${url}api/v1/countries-new'));
+    final response = await http.get(Uri.parse('${url}api/v1/countries-new')).timeout(kHttpTimeout);
 
     if (response.statusCode == 200) {
       countries = jsonDecode(response.body)['data']['countries']['data'];
@@ -5837,7 +5878,7 @@ additionalCharge(reason, amount) async {
           'request_id': driverReq['id'],
           'additional_charges_reason': reason,
           'additional_charges_amount': amount
-        }));
+        })).timeout(kHttpTimeout);
     if (response.statusCode == 200) {
       await getUserDetails();
       result = true;
