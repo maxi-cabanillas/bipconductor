@@ -5368,6 +5368,7 @@ dynamic testDistance = 0;
 // Location location = Location();
 
 positionStreamData() {
+  if (positionStream != null) return;
   positionStream =
       geolocs.Geolocator.getPositionStream(locationSettings: locationSettings)
           .handleError((error) {
@@ -5378,8 +5379,14 @@ positionStreamData() {
           center = LatLng(position.latitude, position.longitude);
         } else {
           positionStream!.cancel();
+          positionStream = null;
         }
       });
+}
+
+void stopPositionStream() {
+  positionStream?.cancel();
+  positionStream = null;
 }
 
 userDelete() async {

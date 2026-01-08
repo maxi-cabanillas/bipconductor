@@ -658,12 +658,14 @@ class _MapsState extends State<Maps>
               distanceFilter: 10,
             );
 
+      stopPositionStream();
+
       _livePosSub =
           geolocator.Geolocator.getPositionStream(locationSettings: settings)
               .listen((pos) async {
             final now = DateTime.now();
             if (_lastLivePosHandledAt != null &&
-                now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
+                now.difference(_lastLivePosHandledAt!).inMilliseconds < 900) {
               return;
             }
             _lastLivePosHandledAt = now;
@@ -720,7 +722,7 @@ class _MapsState extends State<Maps>
             // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
             if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
               final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
-                  now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 4;
+                  now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 8;
               if (shouldCheckDeviation) {
                 _lastRouteDeviationCheckAt = now;
                 await handleRouteDeviationAndSnap(offRouteMeters: 50);
@@ -759,7 +761,7 @@ class _MapsState extends State<Maps>
     final headingDelta =
         _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
 
-    return moved >= 5.0 || headingDelta >= 3.0;
+    return moved >= 8.0 || headingDelta >= 5.0;
   }
 
   /// Clear ONLY route polylines (does not touch markers).
@@ -950,6 +952,9 @@ class _MapsState extends State<Maps>
   void _stopLiveDriverTracking() {
     _livePosSub?.cancel();
     _livePosSub = null;
+    if (userDetails.isNotEmpty && userDetails['role'] == 'driver') {
+      positionStreamData();
+    }
   }
 
   void _updateDriverMarker(LatLng latLng, double newHeading) {
@@ -982,7 +987,7 @@ class _MapsState extends State<Maps>
 
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 250) {
+        now.difference(_lastCameraMove!).inMilliseconds < 450) {
       return; // throttle camera work
     }
     _lastCameraMove = now;
