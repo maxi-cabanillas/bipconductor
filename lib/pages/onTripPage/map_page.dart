@@ -111,6 +111,10 @@ class _MapsState extends State<Maps>
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
   DateTime _lastCameraMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _prevDriverLatLng;
+  DateTime? _lastLivePosHandledAt;
+  DateTime? _lastRouteDeviationCheckAt;
+  LatLng? _lastUiDriverLatLng;
+  double _lastUiDriverHeading = 0.0;
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -642,14 +646,28 @@ class _MapsState extends State<Maps>
         return;
       }
 
-      const settings = geolocator.LocationSettings(
-        accuracy: geolocator.LocationAccuracy.bestForNavigation,
-        distanceFilter: 3,
-      );
+      final settings = Platform.isAndroid
+          ? const geolocator.AndroidSettings(
+              accuracy: geolocator.LocationAccuracy.high,
+              distanceFilter: 10,
+              intervalDuration: Duration(seconds: 5),
+            )
+          : const geolocator.AppleSettings(
+              accuracy: geolocator.LocationAccuracy.high,
+              activityType: geolocator.ActivityType.otherNavigation,
+              distanceFilter: 10,
+            );
 
       _livePosSub =
           geolocator.Geolocator.getPositionStream(locationSettings: settings)
               .listen((pos) async {
+            final now = DateTime.now();
+            if (_lastLivePosHandledAt != null &&
+                now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
+              return;
+            }
+            _lastLivePosHandledAt = now;
+
             final latLng = LatLng(pos.latitude, pos.longitude);
 
             double newHeading;
@@ -701,20 +719,47 @@ class _MapsState extends State<Maps>
             // 🔁 Recalcular y redibujar la ruta en cada update de GPS
             // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
             if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
-              await handleRouteDeviationAndSnap(offRouteMeters: 50);
+              final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
+                  now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 4;
+              if (shouldCheckDeviation) {
+                _lastRouteDeviationCheckAt = now;
+                await handleRouteDeviationAndSnap(offRouteMeters: 50);
+              }
             }
 
             // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
 
-            _updateDriverMarker(latLng, newHeading);
+            final shouldUpdateUi = _shouldUpdateDriverUi(latLng, newHeading);
+            if (shouldUpdateUi) {
+              _lastUiDriverLatLng = latLng;
+              _lastUiDriverHeading = newHeading;
 
-            if (_followDriver) {
-              _animateToDriver(latLng, newHeading);
+              _updateDriverMarker(latLng, newHeading);
+
+              if (_followDriver) {
+                _animateToDriver(latLng, newHeading);
+              }
+
+              valueNotifierHome.incrementNotifier();
             }
-
-            valueNotifierHome.incrementNotifier();
           });
     } catch (_) {}
+  }
+
+  bool _shouldUpdateDriverUi(LatLng latLng, double newHeading) {
+    if (_lastUiDriverLatLng == null) return true;
+
+    final moved = geolocator.Geolocator.distanceBetween(
+      _lastUiDriverLatLng!.latitude,
+      _lastUiDriverLatLng!.longitude,
+      latLng.latitude,
+      latLng.longitude,
+    );
+
+    final headingDelta =
+        _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
+
+    return moved >= 5.0 || headingDelta >= 3.0;
   }
 
   /// Clear ONLY route polylines (does not touch markers).

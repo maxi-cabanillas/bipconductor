@@ -97,8 +97,13 @@ DateTime? _lastDriverLocPushAt;
 double? _lastDriverLocLat;
 double? _lastDriverLocLng;
 
-const Duration kFirebaseLocMinInterval = Duration(seconds: 8);
-const double kFirebaseLocMinMeters = 15.0;
+const Duration kFirebaseLocMinInterval = Duration(seconds: 10);
+const double kFirebaseLocMinMeters = 20.0;
+
+// ---------------------------------------------------------------------------
+// Driver location polling (reduce wakeups)
+// ---------------------------------------------------------------------------
+const Duration kDriverPositionTick = Duration(seconds: 10);
 
 /// Mantiene UNA sola polyline en Google Maps, tomada desde `polyList`.
 /// Esto evita que aparezcan rutas duplicadas o con colores distintos (morada/azul).
@@ -1863,7 +1868,7 @@ currentPositionUpdate() async {
 
   _positionUpdateTimer?.cancel();
 
-  _positionUpdateTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+  _positionUpdateTimer = Timer.periodic(kDriverPositionTick, (timer) async {
     final tickNow = DateTime.now();
     if (userDetails.isNotEmpty && userDetails['role'] == 'driver') {
       serviceEnabled =
@@ -5277,8 +5282,8 @@ StreamSubscription<geolocs.Position>? positionStream;
 geolocs.LocationSettings locationSettings = (platform == TargetPlatform.android)
     ? geolocs.AndroidSettings(
     accuracy: geolocs.LocationAccuracy.high,
-    distanceFilter: 1,
-    intervalDuration: const Duration(milliseconds: 900),
+    distanceFilter: 10,
+    intervalDuration: const Duration(seconds: 5),
     foregroundNotificationConfig:
     const geolocs.ForegroundNotificationConfig(
       notificationText:
@@ -5289,7 +5294,7 @@ geolocs.LocationSettings locationSettings = (platform == TargetPlatform.android)
     : geolocs.AppleSettings(
   accuracy: geolocs.LocationAccuracy.high,
   activityType: geolocs.ActivityType.otherNavigation,
-  distanceFilter: 1,
+  distanceFilter: 10,
   showBackgroundLocationIndicator: true,
 );
 
