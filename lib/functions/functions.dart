@@ -116,7 +116,7 @@ void syncGooglePolylineFromPolyList() {
       visible: true,
       color: Colors.blue,
       width: 5,
-      points: List<LatLng>.from(polyList),
+      points: polyList,
       startCap: Cap.roundCap,
       endCap: Cap.roundCap,
       jointType: JointType.round,
@@ -5278,6 +5278,7 @@ geolocs.LocationSettings locationSettings = (platform == TargetPlatform.android)
     ? geolocs.AndroidSettings(
     accuracy: geolocs.LocationAccuracy.high,
     distanceFilter: 1,
+    intervalDuration: const Duration(milliseconds: 900),
     foregroundNotificationConfig:
     const geolocs.ForegroundNotificationConfig(
       notificationText:

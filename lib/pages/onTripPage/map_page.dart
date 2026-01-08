@@ -107,60 +107,10 @@ class _MapsState extends State<Maps>
 
   // Uber/Didi style: rotate camera to driver heading and keep the car icon pointing "forward" (up) on screen.
   bool _followBearing = true; // false when user moves the map manually
-  double _currentZoom = 19.8;
+  double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
-
-
-  double _navTilt = 45.0; // Google Maps-like navigation tilt (0..60 recommended)
-// --- Heading smoothing + auto-zoom (Google Maps-like navigation) ---
-  double _headingFiltered = 0.0;
-  bool _headingFilterInit = false;
-
-// Estimated speed (m/s) from GPS deltas (used for smoothing/zoom responsiveness)
-  LatLng? _speedPrevLatLng;
-  DateTime _speedPrevAt = DateTime.fromMillisecondsSinceEpoch(0);
-  double _estSpeedMps = 0.0;
-
-// Auto-zoom can be toggled if needed (default ON)
-  bool _autoZoomEnabled = true;
-
-// Last driver position used for route update distance gating
-  LatLng? _lastRouteUpdateDriverLatLng;
-
-  // --- Follow pause/resume (user gestures) ---
-  Timer? _followResumeTimer;
-  DateTime _lastUserMapGestureAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastProgrammaticCamAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  // --- Smooth driver pose rendering (frame interpolation between GPS fixes) ---
-  AnimationController? _driverSmoothCtrl;
-  LatLng? _smoothFromLatLng;
-  LatLng? _smoothToLatLng;
-  double _smoothFromHeading = 0.0;
-  double _smoothToHeading = 0.0;
-  LatLng? _renderDriverLatLng;
-  double _renderDriverHeading = 0.0;
-  DateTime _lastGpsFixAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastSmoothFrameAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  // UI throttles to avoid SurfaceView buffer exhaustion (keeps smoothness without spamming frames)
-  DateTime _lastMarkerUiAt = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastUiNotifierAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  // --- Route update decouple (no UI blocking) ---
-  Timer? _routeDebounceTimer;
-  bool _routeUpdateInFlight = false;
-  DateTime _lastRouteUpdateAt = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastCameraMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _prevDriverLatLng;
-
-  // --- Road snap (OSRM /nearest) ---
-  // Cuando NO hay polyline activa (o estamos lejos de la ruta), el GPS puede “flotar” fuera de la calle.
-  // Con /nearest lo ajustamos suavemente a la calle para que la flecha no se vea fuera del asfalto.
-  LatLng? _roadSnappedLatLng;
-  DateTime _lastRoadSnapAt = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _roadSnapInFlight = false;
-
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -437,7 +387,7 @@ class _MapsState extends State<Maps>
   Future<void> _ensureDriverGoogleArrowIcon() async {
     if (_driverGoogleArrowIcon != null) return;
 
-    const int size = 150; // px (bigger, closer to Google Maps)
+    const int size = 110; // px (sharp enough on most screens)
     final ui.PictureRecorder recorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(recorder);
     final double s = size.toDouble();
@@ -692,15 +642,9 @@ class _MapsState extends State<Maps>
         return;
       }
 
-      final geolocator.LocationSettings settings = Platform.isAndroid
-          ? geolocator.AndroidSettings(
+      const settings = geolocator.LocationSettings(
         accuracy: geolocator.LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
-        intervalDuration: const Duration(milliseconds: 500),
-      )
-          : const geolocator.LocationSettings(
-        accuracy: geolocator.LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
+        distanceFilter: 3,
       );
 
       _livePosSub =
@@ -750,44 +694,25 @@ class _MapsState extends State<Maps>
 
             newHeading = _wrap360(newHeading);
 
-// Speed + heading smoothing (keeps navigation stable like Google Maps)
-            final nowFix = DateTime.now();
-            _updateEstimatedSpeed(latLng, nowFix);
-            double smoothHeading = _filterHeading(newHeading, speedMps: _estSpeedMps);
-
-            // Snap for navigation visuals and stabilize heading using the route's segment direction.
-            // This prevents the map from looking "diagonal" when GPS heading lags.
-            final snappedForNav = _navPoseLatLng(latLng);
-            final routeHead = _routeHeadingFromPolyline(snappedForNav);
-            if (routeHead != null) {
-              final deltaH = _shortestAngleDelta(smoothHeading, routeHead);
-              final w = (_estSpeedMps < 2.5) ? 0.65 : 0.45; // stronger at low speed
-              smoothHeading = _wrap360(smoothHeading + deltaH * w);
-            }
-
-// Auto-zoom while following (does not affect Firebase throttling)
-            if (_followDriver && _followBearing) {
-              _updateAutoZoomForSpeed(_estSpeedMps);
-            }
-
-            center = snappedForNav;
+            center = latLng;
             currentLocation = latLng;
-            heading = smoothHeading;
+            heading = newHeading;
 
-            // 🔁 Recalcular/redibujar ruta sin bloquear el tracking en UI
+            // 🔁 Recalcular y redibujar la ruta en cada update de GPS
             // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
             if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
-              _requestRouteUpdateDebounced();
+              await handleRouteDeviationAndSnap(offRouteMeters: 50);
             }
 
-            // UI tracking: flecha fluida (tipo Google Maps)
-            _startOrUpdateSmoothDriver(snappedForNav, smoothHeading);
+            // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
 
-            final nowUiTick = DateTime.now();
-            if (nowUiTick.difference(_lastUiNotifierAt).inMilliseconds >= 250) {
-              _lastUiNotifierAt = nowUiTick;
-              valueNotifierHome.incrementNotifier();
+            _updateDriverMarker(latLng, newHeading);
+
+            if (_followDriver) {
+              _animateToDriver(latLng, newHeading);
             }
+
+            valueNotifierHome.incrementNotifier();
           });
     } catch (_) {}
   }
@@ -807,6 +732,43 @@ class _MapsState extends State<Maps>
   // ============================
   // Waze-like route styling (Google Maps)
   // ============================
+  void _applyWazePolylineStyle() {
+    try {
+      if (mapType != 'google') return;
+      if (polyList.isEmpty) return;
+
+      // Replace the route polyline with a thick "double stroke" (border + main line)
+      polyline.clear();
+
+      polyline.add(
+        Polyline(
+          polylineId: const PolylineId('route_border'),
+          points: polyList,
+          color: const Color(0xFF6A1B9A).withOpacity(0.25),
+          width: 14,
+          startCap: Cap.roundCap,
+          endCap: Cap.roundCap,
+          jointType: JointType.round,
+          geodesic: true,
+          zIndex: 0,
+        ),
+      );
+
+      polyline.add(
+        Polyline(
+          polylineId: const PolylineId('route_main'),
+          points: polyList,
+          color: const Color(0xFF6A1B9A),
+          width: 9,
+          startCap: Cap.roundCap,
+          endCap: Cap.roundCap,
+          jointType: JointType.round,
+          geodesic: true,
+          zIndex: 1,
+        ),
+      );
+    } catch (_) {}
+  }
 
   int _tripStartValue() {
     if (driverReq.isEmpty) return 0;
@@ -873,9 +835,8 @@ class _MapsState extends State<Maps>
   /// Re-center the map camera to the driver's current GPS position.
   Future<void> centerToCurrentLocation({double? zoom}) async {
     if (_controller == null) return;
-    final pos = _renderDriverLatLng ?? currentLocation;
-    final lat = pos.latitude;
-    final lng = pos.longitude;
+    final lat = currentLocation.latitude;
+    final lng = currentLocation.longitude;
     if (lat == 0.0 && lng == 0.0) return;
 
     final z = zoom ?? _currentZoom ?? 16;
@@ -885,8 +846,6 @@ class _MapsState extends State<Maps>
           CameraPosition(
             target: LatLng(lat, lng),
             zoom: z,
-            bearing: _followBearing ? _cameraBearing : 0.0,
-            tilt: _followBearing ? _navTilt.clamp(0.0, 60.0) : 0.0,
           ),
         ),
       );
@@ -900,9 +859,8 @@ class _MapsState extends State<Maps>
     if (polyList.isEmpty) return;
     if (_routeRebuildInProgress) return;
 
-    final pos = _renderDriverLatLng ?? currentLocation;
-    final lat = pos.latitude;
-    final lng = pos.longitude;
+    final lat = currentLocation.latitude;
+    final lng = currentLocation.longitude;
     if (lat == 0.0 && lng == 0.0) return;
 
     final len = polyList.length;
@@ -949,266 +907,10 @@ class _MapsState extends State<Maps>
     _livePosSub = null;
   }
 
-
-  // ============================
-  // Snap driver marker to the current route polyline (Google Maps-style)
-  // Keeps the arrow visually centered on the road while navigating.
-  // ============================
-  LatLng _snapToRouteIfPossible(LatLng p) {
-    try {
-      if (mapType != 'google') return p;
-      if (polyList.isEmpty) return p;
-
-      // polyList should be List<LatLng> (google_maps_flutter). If not, bail out.
-      final pts = polyList.cast<LatLng>();
-      if (pts.length < 2) return p;
-
-      final snap = _closestPointOnPolyline(p, pts);
-      // Only snap when we're reasonably close to the route (avoid crazy jumps).
-      final d = _approxMetersBetween(p, snap);
-
-      // When navigating at speed, allow a wider snap window (Google-like map matching),
-      // but stay stricter when slow to avoid jumping to nearby parallel roads.
-      final th = (_estSpeedMps < 2.5) ? 45.0 : 85.0; // meters
-      if (d > th) return p; // keep raw if too far from route
-
-      return snap;
-    } catch (_) {
-      return p;
-    }
-  }
-
-
-  // --- OSRM nearest road snap (throttled) ---
-  void _maybeRoadSnap(LatLng raw, {bool force = false}) {
-    if (mapType != 'google') return;
-
-    final now = DateTime.now();
-
-    // No spamear la red: 0.9s entre requests (Google Maps-like “map matching” pero barato).
-    if (!force && now.difference(_lastRoadSnapAt).inMilliseconds < 900) return;
-    if (_roadSnapInFlight) return;
-
-    _roadSnapInFlight = true;
-
-    _osrmNearest(raw).then((snap) {
-      if (!mounted) return;
-      if (snap != null) {
-        _roadSnappedLatLng = snap;
-        _lastRoadSnapAt = DateTime.now();
-      }
-    }).whenComplete(() {
-      _roadSnapInFlight = false;
-    });
-  }
-
-  Future<LatLng?> _osrmNearest(LatLng p) async {
-    try {
-      final url = Uri.parse(
-        'https://routing.openstreetmap.de/routed-car/nearest/v1/driving/${p.longitude},${p.latitude}?number=1',
-      );
-
-      final res = await http.get(url).timeout(const Duration(milliseconds: 900));
-      if (res.statusCode != 200) return null;
-
-      final data = jsonDecode(res.body);
-      final wps = data['waypoints'];
-      if (wps is List && wps.isNotEmpty) {
-        final loc = wps[0]['location'];
-        if (loc is List && loc.length >= 2) {
-          final lon = (loc[0] as num).toDouble();
-          final lat = (loc[1] as num).toDouble();
-          return LatLng(lat, lon);
-        }
-      }
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// Devuelve una posición “visual” para navegar:
-  /// - Si estamos cerca de la polyline, usamos snap a polyline (rápido, local).
-  /// - Si NO hay polyline (o estamos lejos), usamos el último snap a calle (OSRM nearest) si está fresco.
-  LatLng _navPoseLatLng(LatLng raw) {
-    if (mapType != 'google') return raw;
-
-    final hasRoute = polyList.isNotEmpty;
-    final routeSnap = _snapToRouteIfPossible(raw);
-    final dToRoute = _approxMetersBetween(raw, routeSnap);
-
-    // Pedimos road snap si no hay ruta o si estamos lejos de la ruta actual.
-    final needRoad = (!hasRoute) || (dToRoute > 25.0);
-    if (needRoad) {
-      _maybeRoadSnap(raw, force: !hasRoute);
-      final fresh = _roadSnappedLatLng != null &&
-          DateTime.now().difference(_lastRoadSnapAt).inSeconds <= 3;
-      if (fresh) return _roadSnappedLatLng!;
-    }
-
-    return routeSnap;
-  }
-
-
-  double _approxMetersBetween(LatLng a, LatLng b) {
-    // Fast small-distance approximation (equirectangular).
-    final lat0 = (a.latitude + b.latitude) * 0.5;
-    final mPerDegLat = 110540.0;
-    final mPerDegLng = 111320.0 * cos(lat0 * pi / 180.0);
-    final dx = (b.longitude - a.longitude) * mPerDegLng;
-    final dy = (b.latitude - a.latitude) * mPerDegLat;
-    return sqrt(dx * dx + dy * dy);
-  }
-
-  LatLng _closestPointOnPolyline(LatLng p, List<LatLng> poly) {
-    LatLng best = poly.first;
-    double bestD = double.infinity;
-
-    for (int i = 0; i < poly.length - 1; i++) {
-      final a = poly[i];
-      final b = poly[i + 1];
-      final q = _closestPointOnSegment(p, a, b);
-      final d = _approxMetersBetween(p, q);
-      if (d < bestD) {
-        bestD = d;
-        best = q;
-      }
-    }
-    return best;
-  }
-
-  /// Returns the route segment heading (degrees) near [p] if we are close to the current polyline.
-  /// This helps keep the map "forward" like Google Maps (arrow stays up, road aligns).
-  double? _routeHeadingFromPolyline(LatLng p) {
-    try {
-      if (mapType != 'google') return null;
-      if (polyList.isEmpty) return null;
-
-      final pts = polyList.cast<LatLng>();
-      if (pts.length < 2) return null;
-
-      int bestIdx = 0;
-      double bestD = double.infinity;
-
-      for (int i = 0; i < pts.length - 1; i++) {
-        final a = pts[i];
-        final b = pts[i + 1];
-        final q = _closestPointOnSegment(p, a, b);
-        final d = _approxMetersBetween(p, q);
-        if (d < bestD) {
-          bestD = d;
-          bestIdx = i;
-        }
-      }
-
-      // Too far from the route: don't force route heading.
-      final th = (_estSpeedMps < 2.5) ? 55.0 : 95.0;
-      if (bestD > th) return null;
-
-      final a = pts[bestIdx];
-      final b = pts[bestIdx + 1];
-
-      return _bearingBetween(a, b);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  DateTime _lastPolylineHeadSyncAt = DateTime.fromMillisecondsSinceEpoch(0);
-  LatLng? _lastPolylineHeadSyncPos;
-
-  /// Visually keeps the route polyline "attached" to the moving vehicle:
-  /// trims the traveled part and ensures the first point is the snapped driver pose.
-  void _syncPolylineHeadToDriver(LatLng driverOnRoute) {
-    try {
-      if (mapType != 'google') return;
-      if (polyList.isEmpty) return;
-
-      final now = DateTime.now();
-      if (_lastPolylineHeadSyncAt.millisecondsSinceEpoch != 0 &&
-          now.difference(_lastPolylineHeadSyncAt).inMilliseconds < 350) {
-        return;
-      }
-
-      if (_lastPolylineHeadSyncPos != null) {
-        final moved = _approxMetersBetween(_lastPolylineHeadSyncPos!, driverOnRoute);
-        if (moved < 6.0 && now.difference(_lastPolylineHeadSyncAt).inMilliseconds < 900) {
-          return;
-        }
-      }
-
-      final pts = polyList.cast<LatLng>();
-      if (pts.length < 2) return;
-
-      int bestIdx = 0;
-      LatLng bestPoint = pts.first;
-      double bestD = double.infinity;
-
-      for (int i = 0; i < pts.length - 1; i++) {
-        final a = pts[i];
-        final b = pts[i + 1];
-        final q = _closestPointOnSegment(driverOnRoute, a, b);
-        final d = _approxMetersBetween(driverOnRoute, q);
-        if (d < bestD) {
-          bestD = d;
-          bestIdx = i;
-          bestPoint = q;
-        }
-      }
-
-      // If we're far from route, don't mutate the polyline.
-      final th = (_estSpeedMps < 2.5) ? 60.0 : 110.0;
-      if (bestD > th) return;
-
-      // Build a trimmed polyline: current point + remaining points ahead.
-      final newPts = <LatLng>[bestPoint];
-      if (bestIdx + 1 < pts.length) {
-        newPts.addAll(pts.sublist(bestIdx + 1));
-      }
-
-      if (newPts.length < 2) return;
-
-      polyList
-        ..clear()
-        ..addAll(newPts);
-
-      _lastPolylineHeadSyncAt = now;
-      _lastPolylineHeadSyncPos = bestPoint;
-    } catch (_) {}
-  }
-
-  LatLng _closestPointOnSegment(LatLng p, LatLng a, LatLng b) {
-    // Work in meters for stable projection.
-    final lat0 = p.latitude;
-    final mPerDegLat = 110540.0;
-    final mPerDegLng = 111320.0 * cos(lat0 * pi / 180.0);
-
-    double ax = (a.longitude - p.longitude) * mPerDegLng;
-    double ay = (a.latitude - p.latitude) * mPerDegLat;
-    double bx = (b.longitude - p.longitude) * mPerDegLng;
-    double by = (b.latitude - p.latitude) * mPerDegLat;
-
-    final abx = bx - ax;
-    final aby = by - ay;
-    final apx = -ax;
-    final apy = -ay;
-
-    final ab2 = abx * abx + aby * aby;
-    double t = (ab2 == 0) ? 0.0 : (apx * abx + apy * aby) / ab2;
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-
-    final qx = ax + abx * t;
-    final qy = ay + aby * t;
-
-    final qLat = p.latitude + (qy / mPerDegLat);
-    final qLng = p.longitude + (qx / mPerDegLng);
-    return LatLng(qLat, qLng);
-  }
-
   void _updateDriverMarker(LatLng latLng, double newHeading) {
     try {
       myMarkers.removeWhere((m) => m.markerId.value == '1');
+
       final icon = (userDetails['vehicle_type_icon_for'] == 'motor_bike')
           ? pinLocationIcon3
           : (userDetails['vehicle_type_icon_for'] == 'taxi')
@@ -1233,10 +935,9 @@ class _MapsState extends State<Maps>
   void _animateToDriver(LatLng latLng, double newHeading) {
     if (_controller == null) return;
 
-    final targetLatLng = _snapToRouteIfPossible(latLng);
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 150) {
+        now.difference(_lastCameraMove!).inMilliseconds < 250) {
       return; // throttle camera work
     }
     _lastCameraMove = now;
@@ -1247,24 +948,16 @@ class _MapsState extends State<Maps>
     double bearingToApply = desiredBearing;
     bool useMoveCamera = false;
 
-    // If we are updating camera very frequently, prefer moveCamera to avoid animation queue.
-    final frequentUpdates = now.difference(_lastProgrammaticCamAt).inMilliseconds < 250;
-
     if (_followBearing) {
       // Smooth + avoid crazy spins near 0/360 and on sharp turns.
       final delta = _shortestAngleDelta(_cameraBearing, desiredBearing);
 
-      // Noise threshold: more tolerant when slow (GPS jitter).
-      final noise = (_estSpeedMps < 3.0) ? 3.0 : 1.8;
-
-      if (delta.abs() < noise) {
+      // Small noise -> ignore.
+      if (delta.abs() < 2.0) {
         bearingToApply = _wrap360(_cameraBearing);
       } else if (delta.abs() <= 45.0) {
-        // Smooth small rotations (Google-like): more responsive at higher speed.
-        final sp = _estSpeedMps.clamp(0.0, 25.0) / 25.0; // 0..1
-        final k = 0.40 + (0.30 * sp); // 0.40..0.70
-        bearingToApply = _wrap360(_cameraBearing + (delta * k));
-        if (frequentUpdates) useMoveCamera = true;
+        // Smooth small rotations (Uber-like).
+        bearingToApply = _wrap360(_cameraBearing + (delta * 0.35));
       } else {
         // Big turns: snap (prevents long wrong spins).
         bearingToApply = desiredBearing;
@@ -1274,16 +967,11 @@ class _MapsState extends State<Maps>
       _cameraBearing = 0.0;
     }
 
-    if (frequentUpdates) useMoveCamera = true;
-
     final cam = CameraPosition(
-      target: targetLatLng,
+      target: latLng,
       zoom: _currentZoom,
       bearing: bearingToApply,
-      tilt: _followBearing ? _navTilt.clamp(0.0, 60.0) : 0.0,
     );
-
-    _lastProgrammaticCamAt = now;
 
     if (useMoveCamera) {
       _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
@@ -1315,72 +1003,6 @@ class _MapsState extends State<Maps>
     return (v < 0) ? (v + 360.0) : v;
   }
 
-
-  void _updateEstimatedSpeed(LatLng nowPos, DateTime now) {
-    if (_speedPrevLatLng != null &&
-        _speedPrevAt.millisecondsSinceEpoch != 0) {
-      final dtMs = now.difference(_speedPrevAt).inMilliseconds;
-      if (dtMs > 0) {
-        final dist = geolocator.Geolocator.distanceBetween(
-          _speedPrevLatLng!.latitude,
-          _speedPrevLatLng!.longitude,
-          nowPos.latitude,
-          nowPos.longitude,
-        );
-        final dt = dtMs / 1000.0;
-
-        // Raw speed (m/s), clamp insane spikes from GPS jitter.
-        final raw = (dist / dt).clamp(0.0, 55.0);
-
-        // Smooth speed a bit so zoom doesn't pulse.
-        _estSpeedMps = (_estSpeedMps * 0.75) + (raw * 0.25);
-      }
-    }
-
-    _speedPrevLatLng = nowPos;
-    _speedPrevAt = now;
-  }
-
-  double _filterHeading(double rawDeg, {required double speedMps}) {
-    rawDeg = _wrap360(rawDeg);
-
-    if (!_headingFilterInit) {
-      _headingFilterInit = true;
-      _headingFiltered = rawDeg;
-      return rawDeg;
-    }
-
-    // More responsive when faster, more stable when slow.
-    final sp = speedMps.clamp(0.0, 25.0) / 25.0; // 0..1
-    final alpha = 0.10 + (0.35 * sp); // 0.10..0.45
-
-    final delta = _shortestAngleDelta(_headingFiltered, rawDeg);
-    _headingFiltered = _wrap360(_headingFiltered + delta * alpha);
-    return _headingFiltered;
-  }
-
-  double _zoomForSpeed(double speedMps) {
-    // Very close Google Maps-like navigation zoom.
-    // We animate between GPS fixes, so keeping it close feels stable and readable.
-    if (speedMps < 1.5) return 20.2;   // stopped / very slow
-    if (speedMps < 6.0) return 19.8;   // ~0-22 km/h
-    if (speedMps < 12.0) return 19.3;  // ~22-43 km/h
-    if (speedMps < 20.0) return 18.7;  // ~43-72 km/h
-    return 18.1;                       // highway-ish
-  }
-
-  void _updateAutoZoomForSpeed(double speedMps) {
-    if (!_autoZoomEnabled) return;
-
-    // Only auto-zoom when following, otherwise user zoom control wins.
-    if (!_followDriver) return;
-
-    final target = _zoomForSpeed(speedMps).clamp(16.0, 21.0);
-
-    // Smooth zoom changes.
-    final z = ui.lerpDouble(_currentZoom, target, 0.12) ?? target;
-    _currentZoom = z.isNaN ? target : z;
-  }
   /// Signed shortest delta from [from] to [to] in degrees (-180..180).
   double _shortestAngleDelta(double from, double to) {
     final a = _wrap360(from);
@@ -1392,163 +1014,6 @@ class _MapsState extends State<Maps>
   }
 
 
-
-
-
-  // --- Follow pause/resume: keep centered always, pause 10s on user gestures ---
-  void _pauseFollowForUserGesture([Duration duration = const Duration(seconds: 10)]) {
-    _lastUserMapGestureAt = DateTime.now();
-
-    if (_followDriver) {
-      setState(() => _followDriver = false);
-    }
-
-    _followResumeTimer?.cancel();
-    _followResumeTimer = Timer(duration, _maybeResumeFollow);
-  }
-
-  void _maybeResumeFollow() {
-    if (!mounted) return;
-    const duration = Duration(seconds: 10);
-    final since = DateTime.now().difference(_lastUserMapGestureAt);
-
-    if (since >= duration) {
-      if (!_followDriver) {
-        setState(() {
-          _followDriver = true;
-          // When we resume follow, ensure we come back to a close navigation zoom.
-          if (_currentZoom < 19.5) _currentZoom = 19.5;
-        });
-      }
-    } else {
-      // User kept moving the map: wait remaining time.
-      _followResumeTimer?.cancel();
-      _followResumeTimer = Timer(duration - since, _maybeResumeFollow);
-    }
-  }
-
-  // --- Decouple route updates from GPS stream (avoid blocking marker/camera updates) ---
-  void _requestRouteUpdateDebounced() {
-    _routeDebounceTimer?.cancel();
-    _routeDebounceTimer = Timer(const Duration(milliseconds: 700), () {
-      if (!mounted) return;
-      final now = DateTime.now();
-
-// Avoid excessive route refresh if the driver hasn't moved enough.
-      final cur = currentLocation ?? center;
-      if (cur != null && _lastRouteUpdateDriverLatLng != null) {
-        final moved = geolocator.Geolocator.distanceBetween(
-          _lastRouteUpdateDriverLatLng!.latitude,
-          _lastRouteUpdateDriverLatLng!.longitude,
-          cur.latitude,
-          cur.longitude,
-        );
-        if (moved < 25.0 && now.difference(_lastRouteUpdateAt).inMilliseconds < 3500) {
-          return;
-        }
-      }
-
-      if (_routeUpdateInFlight) return;
-      if (now.difference(_lastRouteUpdateAt).inMilliseconds < 1200) return;
-
-      _routeUpdateInFlight = true;
-      _lastRouteUpdateAt = now;
-      _lastRouteUpdateDriverLatLng = (_renderDriverLatLng ?? currentLocation ?? center);
-
-      handleRouteDeviationAndSnap(offRouteMeters: 50)
-          .catchError((_) {})
-          .whenComplete(() {
-        _routeUpdateInFlight = false;
-      });
-    });
-  }
-
-  // --- Smooth pose updates for driver marker (frame interpolation) ---
-  void _startOrUpdateSmoothDriver(LatLng to, double toHeading) {
-    final now = DateTime.now();
-
-    // First fix: apply immediately.
-    if (_renderDriverLatLng == null) {
-      _renderDriverLatLng = to;
-      _renderDriverHeading = toHeading;
-      _applyDriverPose(_renderDriverLatLng!, _renderDriverHeading);
-      _lastGpsFixAt = now;
-      return;
-    }
-
-    _smoothFromLatLng = _renderDriverLatLng;
-    _smoothToLatLng = to;
-    _smoothFromHeading = _renderDriverHeading;
-    _smoothToHeading = toHeading;
-
-    // Duration based on time between fixes (clamped)
-    final ms = now.difference(_lastGpsFixAt).inMilliseconds;
-    _lastGpsFixAt = now;
-    final safeMs = (ms <= 0) ? 120 : ms;
-    final durMs = ((safeMs * 0.70).round()).clamp(60, 160);
-    final duration = Duration(milliseconds: durMs);
-
-    _driverSmoothCtrl?.stop();
-    _driverSmoothCtrl?.dispose();
-    _driverSmoothCtrl = AnimationController(vsync: this, duration: duration);
-
-    _lastSmoothFrameAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-    _driverSmoothCtrl!.addListener(() {
-      if (!mounted) return;
-
-      // Limit rebuild rate a bit (≈30fps) to save battery
-      final n = DateTime.now();
-      if (_lastSmoothFrameAt.millisecondsSinceEpoch != 0 &&
-          n.difference(_lastSmoothFrameAt).inMilliseconds < 16) {
-        return;
-      }
-      _lastSmoothFrameAt = n;
-
-      final t = _driverSmoothCtrl!.value;
-
-      final from = _smoothFromLatLng!;
-      final toPos = _smoothToLatLng!;
-
-      final lat = ui.lerpDouble(from.latitude, toPos.latitude, t)!;
-      final lng = ui.lerpDouble(from.longitude, toPos.longitude, t)!;
-
-      final delta = _shortestAngleDelta(_smoothFromHeading, _smoothToHeading);
-      final head = _wrap360(_smoothFromHeading + delta * t);
-
-      _renderDriverLatLng = LatLng(lat, lng);
-      _renderDriverHeading = head;
-
-      _applyDriverPose(_renderDriverLatLng!, _renderDriverHeading);
-    });
-
-    _driverSmoothCtrl!.addStatusListener((s) {
-      if (!mounted) return;
-      if (s == AnimationStatus.completed || s == AnimationStatus.dismissed) {
-        _renderDriverLatLng = to;
-        _renderDriverHeading = toHeading;
-      }
-    });
-
-    _driverSmoothCtrl!.forward(from: 0);
-  }
-
-  void _applyDriverPose(LatLng latLng, double headingDeg) {
-    final nowUi = DateTime.now();
-
-    // Update camera first (keeps map centered + "arrow up" feeling)
-    if (_followDriver) {
-      _animateToDriver(latLng, headingDeg);
-    }
-
-    // When following + bearing mode, align marker to camera bearing so it stays "up"
-    final markerHeading = (_followDriver && _followBearing) ? _cameraBearing : headingDeg;
-    // Throttle marker updates to keep the map smooth and avoid buffer queue overflow
-    if (nowUi.difference(_lastMarkerUiAt).inMilliseconds >= 70) {
-      _lastMarkerUiAt = nowUi;
-      _updateDriverMarker(latLng, markerHeading);
-    }
-  }
 
 
   @override
@@ -1566,10 +1031,6 @@ class _MapsState extends State<Maps>
 
     _bippSearchingCtrl.dispose();
     _bippLaserCtrl.dispose();
-
-    _followResumeTimer?.cancel();
-    _routeDebounceTimer?.cancel();
-    _driverSmoothCtrl?.dispose();
 
     super.dispose();
   }
@@ -2310,7 +1771,7 @@ class _MapsState extends State<Maps>
                           .longitude,
                       center.latitude,
                       center.longitude);
-                  if (userDetails['role'] != 'driver' && dist > 0 &&
+                  if (dist > 0 &&
                       animationController == null &&
                       (_controller != null || mapType != 'google')) {
                     animationController = AnimationController(
@@ -3574,17 +3035,6 @@ class _MapsState extends State<Maps>
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
-                                                  onCameraMoveStarted: () {
-                                                    final now = DateTime.now();
-                                                    // Ignore camera moves triggered by our own animate/moveCamera.
-                                                    if (now.difference(_lastProgrammaticCamAt).inMilliseconds < 350) return;
-                                                    _pauseFollowForUserGesture(const Duration(seconds: 10));
-                                                  },
-                                                  onCameraMove: (pos) {
-                                                    final now = DateTime.now();
-                                                    if (now.difference(_lastProgrammaticCamAt).inMilliseconds < 350) return;
-                                                    _lastUserMapGestureAt = now;
-                                                  },
                                                   initialCameraPosition:
                                                   CameraPosition(
                                                     target: (center ==
@@ -3593,8 +3043,6 @@ class _MapsState extends State<Maps>
                                                         : center,
                                                     zoom:
                                                     18.0,
-                                                    bearing: 0.0,
-                                                    tilt: _navTilt.clamp(0.0, 60.0),
                                                   ),
                                                   markers: Set<
                                                       Marker>.from(
@@ -3634,16 +3082,10 @@ class _MapsState extends State<Maps>
                                                       mapController:
                                                       _fmController,
                                                       options: fm.MapOptions(
-                                                        initialCenter:
-                                                        fmlt.LatLng(center.latitude, center.longitude),
-                                                        initialZoom: 16,
-                                                        onTap: (P, L) {},
-                                                        onPositionChanged: (pos, hasGesture) {
-                                                          if (hasGesture) {
-                                                            _pauseFollowForUserGesture(const Duration(seconds: 10));
-                                                          }
-                                                        },
-                                                      ),
+                                                          initialCenter:
+                                                          fmlt.LatLng(center.latitude, center.longitude),
+                                                          initialZoom: 16,
+                                                          onTap: (P, L) {}),
                                                       children: [
                                                         fm.TileLayer(
                                                           // minZoom: 10,
@@ -9652,21 +9094,17 @@ class _MapsState extends State<Maps>
 
         LatLng newPos = LatLng(lat, lng);
 
-        // Seguir automáticamente al vehículo en Google Maps (modo navegación tipo Google Maps)
-        // Queremos: flecha "hacia arriba" => cámara rota con el bearing.
-        // Importante: usar moveCamera (no animateCamera) para evitar lag / cola de animaciones.
-        if (mapType == 'google' && _controller != null && _followDriver) {
+        // Seguir automáticamente al vehículo en Google Maps
+        if (mapType == 'google' && _controller != null) {
           try {
-            final desiredBearing = _followBearing ? _wrap360(bearing) : 0.0;
-            final cam = CameraPosition(
-              target: newPos,
-              zoom: _currentZoom,
-              bearing: desiredBearing,
-              tilt: _followBearing ? _navTilt.clamp(0.0, 60.0) : 0.0,
+            _controller!.animateCamera(
+              CameraUpdate.newCameraPosition(
+                CameraPosition(
+                  target: newPos,
+                  zoom: 18.0,
+                ),
+              ),
             );
-            _lastProgrammaticCamAt = DateTime.now();
-            _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
-            _cameraBearing = desiredBearing;
           } catch (_) {}
         }
 
@@ -11068,9 +10506,6 @@ class _TRipBottomSheetConfrimationState
     extends State<TRipBottomSheetConfrimation> {
   bool isLoading = false;
 
-  // Throttle rebuild/notifier to avoid over-rendering GoogleMap surface
-  DateTime _lastUiNotifierAt = DateTime.fromMillisecondsSinceEpoch(0);
-
   @override
   Widget build(BuildContext context) {
     var media = MediaQuery.of(context).size;
@@ -11125,11 +10560,7 @@ class _TRipBottomSheetConfrimationState
                         .toString() ==
                         '1') {
                       unloadImage = true;
-                      final nowUiTick = DateTime.now();
-                      if (nowUiTick.difference(_lastUiNotifierAt).inMilliseconds >= 250) {
-                        _lastUiNotifierAt = nowUiTick;
-                        valueNotifierHome.incrementNotifier();
-                      }
+                      valueNotifierHome.incrementNotifier();
 
                       Navigator.pop(context);
                     } else if (driverReq['enable_shipment_unload_feature']
