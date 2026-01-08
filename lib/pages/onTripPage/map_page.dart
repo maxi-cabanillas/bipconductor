@@ -113,8 +113,16 @@ class _MapsState extends State<Maps>
   LatLng? _prevDriverLatLng;
   DateTime? _lastLivePosHandledAt;
   DateTime? _lastRouteDeviationCheckAt;
-  LatLng? _lastUiDriverLatLng;
-  double _lastUiDriverHeading = 0.0;
+  Ticker? _uiSmoothingTicker;
+  LatLng? _uiTargetLatLng;
+  double _uiTargetHeading = 0.0;
+  LatLng? _uiDisplayLatLng;
+  double _uiDisplayHeading = 0.0;
+  DateTime? _uiLastTick;
+  int _offRouteConsecutive = 0;
+
+  static const Duration _uiFrameInterval = Duration(milliseconds: 40);
+  static const Duration _uiSmoothingWindow = Duration(milliseconds: 280);
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -645,121 +653,132 @@ class _MapsState extends State<Maps>
           permStatus == geolocator.LocationPermission.deniedForever) {
         return;
       }
+      positionStreamData();
+      _startUiSmoothingTicker();
 
-      final settings = Platform.isAndroid
-          ? const geolocator.AndroidSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              distanceFilter: 10,
-              intervalDuration: Duration(seconds: 5),
-            )
-          : const geolocator.AppleSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              activityType: geolocator.ActivityType.otherNavigation,
-              distanceFilter: 10,
+      _livePosSub = positionStreamUpdates.listen((pos) async {
+        final now = DateTime.now();
+        if (_lastLivePosHandledAt != null &&
+            now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
+          return;
+        }
+        _lastLivePosHandledAt = now;
+
+        final latLng = LatLng(pos.latitude, pos.longitude);
+
+        double newHeading;
+
+        if (_prevDriverLatLng != null) {
+          final moved = geolocator.Geolocator.distanceBetween(
+            _prevDriverLatLng!.latitude,
+            _prevDriverLatLng!.longitude,
+            latLng.latitude,
+            latLng.longitude,
+          );
+
+          // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
+          // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
+          if (moved >= 2.0) {
+            newHeading = _bearingBetween(_prevDriverLatLng!, latLng);
+
+            // Only advance the reference point when movement is real;
+            // otherwise small GPS jitter can create random bearings.
+            _prevDriverLatLng = latLng;
+          } else {
+            newHeading = heading; // keep last stable heading
+          }
+        } else {
+          // First fix: use sensor heading if available (may be 0 / NaN at low speed).
+          final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
+          newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
+
+          _prevDriverLatLng = latLng;
+        }
+
+        // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
+        final sensorHeading2 = (pos.heading.isNaN) ? 0.0 : pos.heading;
+        if (sensorHeading2 != 0.0) {
+          final delta = _shortestAngleDelta(newHeading, sensorHeading2).abs();
+          if (delta <= 20.0) {
+            newHeading = _wrap360(
+              newHeading + _shortestAngleDelta(newHeading, sensorHeading2) * 0.25,
             );
+          }
+        }
 
-      _livePosSub =
-          geolocator.Geolocator.getPositionStream(locationSettings: settings)
-              .listen((pos) async {
-            final now = DateTime.now();
-            if (_lastLivePosHandledAt != null &&
-                now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
-              return;
-            }
-            _lastLivePosHandledAt = now;
+        newHeading = _wrap360(newHeading);
 
-            final latLng = LatLng(pos.latitude, pos.longitude);
+        center = latLng;
+        currentLocation = latLng;
+        heading = newHeading;
 
-            double newHeading;
+        if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
+          final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
+              now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 12;
+          if (shouldCheckDeviation) {
+            _lastRouteDeviationCheckAt = now;
+            await handleRouteDeviationAndSnap(offRouteMeters: 70);
+          }
+        }
 
-            if (_prevDriverLatLng != null) {
-              final moved = geolocator.Geolocator.distanceBetween(
-                _prevDriverLatLng!.latitude,
-                _prevDriverLatLng!.longitude,
-                latLng.latitude,
-                latLng.longitude,
-              );
+        _uiTargetLatLng = latLng;
+        _uiTargetHeading = newHeading;
 
-              // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
-              // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
-              if (moved >= 2.0) {
-                newHeading = _bearingBetween(_prevDriverLatLng!, latLng);
+        if (_uiDisplayLatLng == null) {
+          _uiDisplayLatLng = latLng;
+          _uiDisplayHeading = newHeading;
+          _updateDriverMarker(latLng, newHeading);
+          valueNotifierHome.incrementNotifier();
+        }
 
-                // Only advance the reference point when movement is real;
-                // otherwise small GPS jitter can create random bearings.
-                _prevDriverLatLng = latLng;
-              } else {
-                newHeading = heading; // keep last stable heading
-              }
-            } else {
-              // First fix: use sensor heading if available (may be 0 / NaN at low speed).
-              final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
-              newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
-
-              _prevDriverLatLng = latLng;
-            }
-
-            // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
-            final sensorHeading2 = (pos.heading.isNaN) ? 0.0 : pos.heading;
-            if (sensorHeading2 != 0.0) {
-              final delta = _shortestAngleDelta(newHeading, sensorHeading2).abs();
-              if (delta <= 20.0) {
-                newHeading = _wrap360(
-                  newHeading + _shortestAngleDelta(newHeading, sensorHeading2) * 0.25,
-                );
-              }
-            }
-
-            newHeading = _wrap360(newHeading);
-
-            center = latLng;
-            currentLocation = latLng;
-            heading = newHeading;
-
-            // 🔁 Recalcular y redibujar la ruta en cada update de GPS
-            // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
-            if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
-              final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
-                  now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 4;
-              if (shouldCheckDeviation) {
-                _lastRouteDeviationCheckAt = now;
-                await handleRouteDeviationAndSnap(offRouteMeters: 50);
-              }
-            }
-
-            // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
-
-            final shouldUpdateUi = _shouldUpdateDriverUi(latLng, newHeading);
-            if (shouldUpdateUi) {
-              _lastUiDriverLatLng = latLng;
-              _lastUiDriverHeading = newHeading;
-
-              _updateDriverMarker(latLng, newHeading);
-
-              if (_followDriver) {
-                _animateToDriver(latLng, newHeading);
-              }
-
-              valueNotifierHome.incrementNotifier();
-            }
-          });
+        if (_followDriver) {
+          _animateToDriver(latLng, newHeading);
+        }
+      });
     } catch (_) {}
   }
 
-  bool _shouldUpdateDriverUi(LatLng latLng, double newHeading) {
-    if (_lastUiDriverLatLng == null) return true;
+  void _startUiSmoothingTicker() {
+    if (_uiSmoothingTicker != null) return;
 
-    final moved = geolocator.Geolocator.distanceBetween(
-      _lastUiDriverLatLng!.latitude,
-      _lastUiDriverLatLng!.longitude,
-      latLng.latitude,
-      latLng.longitude,
-    );
+    _uiSmoothingTicker = createTicker((_) {
+      final now = DateTime.now();
+      if (_uiLastTick != null &&
+          now.difference(_uiLastTick!) < _uiFrameInterval) {
+        return;
+      }
+      _uiLastTick = now;
 
-    final headingDelta =
-        _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
+      if (_uiTargetLatLng == null) return;
+      final target = _uiTargetLatLng!;
+      final current = _uiDisplayLatLng ?? target;
 
-    return moved >= 5.0 || headingDelta >= 3.0;
+      final frameMs = _uiFrameInterval.inMilliseconds.toDouble();
+      final smoothMs = _uiSmoothingWindow.inMilliseconds.toDouble();
+      final alpha = (frameMs / smoothMs).clamp(0.08, 1.0);
+
+      final nextLat = current.latitude + (target.latitude - current.latitude) * alpha;
+      final nextLng = current.longitude + (target.longitude - current.longitude) * alpha;
+      final nextHeading = _wrap360(
+        _uiDisplayHeading +
+            _shortestAngleDelta(_uiDisplayHeading, _uiTargetHeading) * alpha,
+      );
+
+      _uiDisplayLatLng = LatLng(nextLat, nextLng);
+      _uiDisplayHeading = nextHeading;
+
+      _updateDriverMarker(_uiDisplayLatLng!, _uiDisplayHeading);
+      valueNotifierHome.incrementNotifier();
+    });
+
+    _uiSmoothingTicker?.start();
+  }
+
+  void _stopUiSmoothingTicker() {
+    _uiSmoothingTicker?.stop();
+    _uiSmoothingTicker?.dispose();
+    _uiSmoothingTicker = null;
+    _uiLastTick = null;
   }
 
   /// Clear ONLY route polylines (does not touch markers).
@@ -899,7 +918,7 @@ class _MapsState extends State<Maps>
 
   /// If the driver goes off-route by [offRouteMeters], rebuild the route polyline from the current position.
   /// This is throttled to avoid hammering the Directions API.
-  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 50}) async {
+  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 70}) async {
     if (driverReq.isEmpty) return;
     if (polyList.isEmpty) return;
     if (_routeRebuildInProgress) return;
@@ -923,13 +942,21 @@ class _MapsState extends State<Maps>
       if (minD <= offRouteMeters) break;
     }
 
-    if (minD <= offRouteMeters) return;
+    if (minD <= offRouteMeters) {
+      _offRouteConsecutive = 0;
+      return;
+    }
+
+    _offRouteConsecutive += 1;
+    if (_offRouteConsecutive < 2) {
+      return;
+    }
 
     final now = DateTime.now();
     if (_lastRouteRebuildAt != null) {
       final seconds = now.difference(_lastRouteRebuildAt!).inSeconds;
       // Cooldown: avoid rebuilding too often (cost + lag).
-      if (seconds < 8 && minD < offRouteMeters * 3) {
+      if (seconds < 12 && minD < offRouteMeters * 3) {
         return;
       }
     }
@@ -943,6 +970,7 @@ class _MapsState extends State<Maps>
       // If rebuild fails, keep the current polyline.
     } finally {
       _routeRebuildInProgress = false;
+      _offRouteConsecutive = 0;
     }
   }
 
@@ -950,30 +978,36 @@ class _MapsState extends State<Maps>
   void _stopLiveDriverTracking() {
     _livePosSub?.cancel();
     _livePosSub = null;
+    _stopUiSmoothingTicker();
   }
 
   void _updateDriverMarker(LatLng latLng, double newHeading) {
     try {
-      myMarkers.removeWhere((m) => m.markerId.value == '1');
-
       final icon = (userDetails['vehicle_type_icon_for'] == 'motor_bike')
           ? pinLocationIcon3
           : (userDetails['vehicle_type_icon_for'] == 'taxi')
           ? pinLocationIcon2
           : pinLocationIcon;
 
-      myMarkers.add(
-        Marker(
-          markerId: const MarkerId('1'),
-          position: latLng,
-          icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
-              ? _driverGoogleArrowIcon!
-              : icon,
-          rotation: _vehicleRotationDeg(newHeading),
-          flat: true,
-          anchor: const Offset(0.5, 0.5),
-        ),
+      final marker = Marker(
+        markerId: const MarkerId('1'),
+        position: latLng,
+        icon: (mapType == 'google' &&
+                userDetails['role'] == 'driver' &&
+                _driverGoogleArrowIcon != null)
+            ? _driverGoogleArrowIcon!
+            : icon,
+        rotation: _vehicleRotationDeg(newHeading),
+        flat: true,
+        anchor: const Offset(0.5, 0.5),
       );
+
+      final index = myMarkers.indexWhere((m) => m.markerId.value == '1');
+      if (index >= 0) {
+        myMarkers[index] = marker;
+      } else {
+        myMarkers.add(marker);
+      }
     } catch (_) {}
   }
 
@@ -982,7 +1016,7 @@ class _MapsState extends State<Maps>
 
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 250) {
+        now.difference(_lastCameraMove!).inMilliseconds < 700) {
       return; // throttle camera work
     }
     _lastCameraMove = now;
