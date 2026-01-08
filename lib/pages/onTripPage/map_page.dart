@@ -647,12 +647,12 @@ class _MapsState extends State<Maps>
       }
 
       final settings = Platform.isAndroid
-          ? const geolocator.AndroidSettings(
+          ? geolocator.AndroidSettings(
               accuracy: geolocator.LocationAccuracy.high,
               distanceFilter: 10,
-              intervalDuration: Duration(seconds: 5),
+              intervalDuration: const Duration(seconds: 5),
             )
-          : const geolocator.AppleSettings(
+          : geolocator.AppleSettings(
               accuracy: geolocator.LocationAccuracy.high,
               activityType: geolocator.ActivityType.otherNavigation,
               distanceFilter: 10,
