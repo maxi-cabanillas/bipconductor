@@ -24,7 +24,6 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'package:permission_handler/permission_handler.dart' as perm;
 import 'package:quick_nav/quick_nav.dart';
-import 'package:vector_math/vector_math.dart' as vector;
 import 'dart:io';
 import '../../functions/functions.dart';
 import '../../functions/geohash.dart';
@@ -33,7 +32,6 @@ import '../../styles/styles.dart';
 import '../../translation/translation.dart';
 import '../../widgets/widgets.dart';
 import '../NavigatorPages/notification.dart';
-import '../NavigatorPages/withdraw.dart';
 import '../NavigatorPages/driverearnings.dart';
 import '../NavigatorPages/history.dart';
 import '../chatPage/chat_page.dart';
@@ -107,8 +105,8 @@ class _MapsState extends State<Maps>
 
 
   // Uber/Didi style: rotate camera to driver heading and keep the car icon pointing "forward" (up) on screen.
-  bool _followBearing = true; // false when user moves the map manually
-  double _currentZoom = 18.0;
+  final bool _followBearing = true; // false when user moves the map manually
+  final double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
   double _headingDeg = 0.0;
   double _camBearingDeg = 0.0;
@@ -1060,8 +1058,7 @@ class _MapsState extends State<Maps>
     if (_controller == null) return;
 
     final now = DateTime.now();
-    if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 450) {
+    if (now.difference(_lastCameraMove).inMilliseconds < 450) {
       return; // throttle camera work
     }
     if (_lastCameraTarget != null) {
@@ -1832,26 +1829,26 @@ class _MapsState extends State<Maps>
     // Bottom sheet (on-ride) sizing:
     // - _panelCollapsed: cuánto se esconde cuando está "abajo"
     // - _panelPeekHeight: cuánto queda visible cuando está "abajo" (bajalo para que se vea menos y el mapa se vea más)
-    final double _panelHeight = media.height * 1.2;
-    final double _panelPeekHeight = media.height * 0.10;
-    final double _panelCollapsed = _panelHeight - _panelPeekHeight;
+    final double panelHeight = media.height * 1.2;
+    final double panelPeekHeight = media.height * 0.10;
+    final double panelCollapsed = panelHeight - panelPeekHeight;
 
     // Límite de apertura para que el panel NO tape toda la pantalla:
     // - Con viaje iniciado abrimos más (como tu imagen 3A).
     // - Esperando al cliente abrimos menos (como tu imagen 4A).
-    final bool _tripStarted = (driverReq.isNotEmpty &&
+    final bool tripStarted = (driverReq.isNotEmpty &&
         (driverReq['is_trip_start'] == 1 || driverReq['is_trip_start'] == true));
 
-    final double _panelMaxOpenVisible =
-    _tripStarted ? (media.height * 0.72) : (media.height * 0.42);
+    final double panelMaxOpenVisible =
+    tripStarted ? (media.height * 0.72) : (media.height * 0.42);
 
     // "hidden" mínimo (más chico = más abierto) para que visible nunca supere _panelMaxOpenVisible.
-    final double _panelOpenHidden =
-    (_panelHeight - _panelMaxOpenVisible).clamp(0.0, _panelCollapsed);
+    final double panelOpenHidden =
+    (panelHeight - panelMaxOpenVisible).clamp(0.0, panelCollapsed);
 
-    final double _panelHidden =
-    (addressBottom ?? _panelCollapsed).clamp(_panelOpenHidden, _panelCollapsed);
-    final double _panelVisible = _panelHeight - _panelHidden;
+    final double panelHidden =
+    (addressBottom ?? panelCollapsed).clamp(panelOpenHidden, panelCollapsed);
+    final double panelVisible = panelHeight - panelHidden;
 
     return PopScope(
       canPop: true,
@@ -1861,9 +1858,9 @@ class _MapsState extends State<Maps>
             builder: (context, value, child) {
               // Si cambia el estado de inicio del viaje, refrescamos banderas (pickup/destino)
               // para que siempre se vea la bandera final cuando corresponde.
-              final int _ts = _tripStartValue();
-              if (_ts != _lastTripStartValueMemo) {
-                _lastTripStartValueMemo = _ts;
+              final int ts = _tripStartValue();
+              if (ts != _lastTripStartValueMemo) {
+                _lastTripStartValueMemo = ts;
                 WidgetsBinding.instance.addPostFrameCallback((_) async {
                   if (!mounted) return;
                   await addMarker();
@@ -3231,7 +3228,7 @@ class _MapsState extends State<Maps>
                                               mapMarkerStream,
                                               builder: (context,
                                                   snapshot) {
-                                                final bool _bippTopPanelShown =
+                                                final bool bippTopPanelShown =
                                                     userDetails.isNotEmpty &&
                                                         userDetails['role'] != 'owner' &&
                                                         driverReq.isEmpty &&
@@ -3239,8 +3236,8 @@ class _MapsState extends State<Maps>
                                                         (userDetails['low_balance'] != true) &&
                                                         (userDetails['car_make_name'] != null);
 
-                                                final double _bippTopPadding =
-                                                    (_bippTopPanelShown
+                                                final double bippTopPadding =
+                                                    (bippTopPanelShown
                                                         ? (media.height * 0.33)
                                                         : (media.height * 0.10)) +
                                                         MediaQuery.of(context).padding.top;
@@ -3251,9 +3248,9 @@ class _MapsState extends State<Maps>
                                                   },
                                                   padding: EdgeInsets.only(
                                                     bottom: (driverReq['accepted_at'] != null)
-                                                        ? (_panelVisible + MediaQuery.of(context).padding.bottom + 8)
+                                                        ? (panelVisible + MediaQuery.of(context).padding.bottom + 8)
                                                         : (media.width * 1),
-                                                    top: _bippTopPadding,
+                                                    top: bippTopPadding,
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
@@ -5079,7 +5076,7 @@ class _MapsState extends State<Maps>
                                               const Duration(
                                                   milliseconds:
                                                   250),
-                                              bottom: -_panelHidden,
+                                              bottom: -panelHidden,
                                               child:
                                               GestureDetector(
                                                 onVerticalDragStart:
@@ -5087,7 +5084,7 @@ class _MapsState extends State<Maps>
                                                   _cont.jumpTo(0.0);
                                                   start = v.globalPosition.dy;
                                                   // Si está null, lo arrancamos colapsado (bien abajo)
-                                                  addressBottom ??= _panelCollapsed;
+                                                  addressBottom ??= panelCollapsed;
                                                   _addressBottom = addressBottom;
                                                   gesture.clear();
                                                 },
@@ -5095,17 +5092,17 @@ class _MapsState extends State<Maps>
                                                     (v) {
                                                   final double dy = (v.globalPosition.dy - start);
                                                   final double next =
-                                                  (_addressBottom + dy).clamp(_panelOpenHidden, _panelCollapsed).toDouble();
+                                                  (_addressBottom + dy).clamp(panelOpenHidden, panelCollapsed).toDouble();
                                                   setState(() {
                                                     addressBottom = next;
                                                   });
                                                 },
                                                 onVerticalDragEnd:
                                                     (v) {
-                                                  final double current = (addressBottom ?? _panelCollapsed).toDouble();
-                                                  final double mid = (_panelCollapsed + _panelOpenHidden) * 0.5;
+                                                  final double current = (addressBottom ?? panelCollapsed).toDouble();
+                                                  final double mid = (panelCollapsed + panelOpenHidden) * 0.5;
                                                   setState(() {
-                                                    addressBottom = (current > mid) ? _panelCollapsed : _panelOpenHidden;
+                                                    addressBottom = (current > mid) ? panelCollapsed : panelOpenHidden;
                                                   });
                                                 },
                                                 child: Column(
@@ -8673,11 +8670,11 @@ class _MapsState extends State<Maps>
                                               ),
                                             ],
                                           ),
+                                          height: media.width * 0.07,
+                                          width: media.width * 0.08,
                                           child: Center(
                                             child: Icon(Icons.flag, color: Colors.white, size: media.width * 0.045),
                                           ),
-                                          height: media.width * 0.07,
-                                          width: media.width * 0.08,
                                         )
                                       ],
                                     )),
@@ -8769,11 +8766,11 @@ class _MapsState extends State<Maps>
                                                               ),
                                                             ],
                                                           ),
+                                                          height: media.width * 0.07,
+                                                          width: media.width * 0.08,
                                                           child: Center(
                                                             child: Icon(Icons.flag, color: Colors.white, size: media.width * 0.045),
                                                           ),
-                                                          height: media.width * 0.07,
-                                                          width: media.width * 0.08,
                                                         )
                                                       ],
                                                     )
@@ -8851,11 +8848,11 @@ class _MapsState extends State<Maps>
                                                   ),
                                                 ],
                                               ),
+                                              height: media.width * 0.07,
+                                              width: media.width * 0.08,
                                               child: Center(
                                                 child: Icon(Icons.flag, color: Colors.white, size: media.width * 0.045),
                                               ),
-                                              height: media.width * 0.07,
-                                              width: media.width * 0.08,
                                             )
                                           ],
                                         )),
@@ -9275,10 +9272,10 @@ class _MapsState extends State<Maps>
     }
 
 
-    final bool _headingUpMode = _followDriver && _followBearing && markerid.toString() == '1';
-    final bool _markerFlat = !_headingUpMode;
-    final double _markerRotation = _headingUpMode ? 0.0 : _vehicleRotationDeg(bearing);
-    final double _bearingToApply = _followBearing ? _wrap360(bearing) : 0.0;
+    final bool headingUpMode = _followDriver && _followBearing && markerid.toString() == '1';
+    final bool markerFlat = !headingUpMode;
+    final double markerRotation = headingUpMode ? 0.0 : _vehicleRotationDeg(bearing);
+    final double bearingToApply = _followBearing ? _wrap360(bearing) : 0.0;
 
     dynamic carMarker;
     if (name == '' && number == '') {
@@ -9287,8 +9284,8 @@ class _MapsState extends State<Maps>
           position: LatLng(fromLat, fromLong),
           icon: icon,
           anchor: const Offset(0.5, 0.5),
-          flat: _markerFlat,
-          rotation: _markerRotation,
+          flat: markerFlat,
+          rotation: markerRotation,
           draggable: false);
     } else {
       carMarker = Marker(
@@ -9297,8 +9294,8 @@ class _MapsState extends State<Maps>
           icon: icon,
           anchor: const Offset(0.5, 0.5),
           infoWindow: InfoWindow(title: number, snippet: name),
-          flat: _markerFlat,
-          rotation: _markerRotation,
+          flat: markerFlat,
+          rotation: markerRotation,
           draggable: false);
     }
 
@@ -9330,10 +9327,10 @@ class _MapsState extends State<Maps>
             final cam = CameraPosition(
               target: newPos,
               zoom: _currentZoom,
-              bearing: _bearingToApply,
+              bearing: bearingToApply,
             );
             _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
-            _cameraBearing = _bearingToApply;
+            _cameraBearing = bearingToApply;
           } catch (_) {}
         }
 
@@ -9345,8 +9342,8 @@ class _MapsState extends State<Maps>
               position: newPos,
               icon: icon,
               anchor: const Offset(0.5, 0.5),
-              flat: _markerFlat,
-              rotation: _markerRotation,
+              flat: markerFlat,
+              rotation: markerRotation,
               draggable: false);
         } else {
           carMarker = Marker(
@@ -9355,8 +9352,8 @@ class _MapsState extends State<Maps>
               icon: icon,
               infoWindow: InfoWindow(title: number, snippet: name),
               anchor: const Offset(0.5, 0.5),
-              flat: _markerFlat,
-              rotation: _markerRotation,
+              flat: markerFlat,
+              rotation: markerRotation,
               draggable: false);
         }
 
@@ -10942,7 +10939,7 @@ class _BippLaserBorderPainter extends CustomPainter {
 // Pequeña línea ECG para el botón "BUSCANDO VIAJE"
 // =============================================================
 class _BippEcgLine extends StatefulWidget {
-  const _BippEcgLine({super.key});
+  const _BippEcgLine();
 
   @override
   State<_BippEcgLine> createState() => _BippEcgLineState();
