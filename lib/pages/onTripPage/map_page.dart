@@ -792,7 +792,7 @@ class _MapsState extends State<Maps>
         nextLng,
       );
       final headingDelta =
-          _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
+      _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
       if (moved < 0.5 && headingDelta < 1.0) {
         return;
       }
@@ -1027,16 +1027,22 @@ class _MapsState extends State<Maps>
           ? pinLocationIcon2
           : pinLocationIcon;
 
+      // Heading-up mode: when we are following the driver AND bearing-follow is enabled,
+      // keep the arrow pointing up on screen and rotate the map camera instead.
+      final bool headingUpMode = _followDriver && _followBearing;
+      final double rot = headingUpMode ? 0.0 : _vehicleRotationDeg(newHeading);
+      final bool flat = !headingUpMode; // flat=true to apply rotation in north-up mode
+
       final marker = Marker(
         markerId: const MarkerId('1'),
         position: latLng,
         icon: (mapType == 'google' &&
-                userDetails['role'] == 'driver' &&
-                _driverGoogleArrowIcon != null)
+            userDetails['role'] == 'driver' &&
+            _driverGoogleArrowIcon != null)
             ? _driverGoogleArrowIcon!
             : icon,
-        rotation: 0.0,
-        flat: false,
+        rotation: rot,
+        flat: flat,
         anchor: const Offset(0.5, 0.5),
       );
 
@@ -1048,6 +1054,7 @@ class _MapsState extends State<Maps>
       }
     } catch (_) {}
   }
+
 
   void _animateToDriver(LatLng latLng, double newHeading) {
     if (_controller == null) return;
@@ -1065,7 +1072,7 @@ class _MapsState extends State<Maps>
         latLng.longitude,
       );
       final headingDelta =
-          _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
+      _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
       if (moved < _cameraMinMoveMeters && headingDelta < _cameraMinHeadingDelta) {
         return;
       }
@@ -1658,7 +1665,9 @@ class _MapsState extends State<Maps>
               myMarkers = [
                 Marker(
                     markerId: const MarkerId('1'),
-                    rotation: _vehicleRotationDeg(heading),
+                    rotation: (_followBearing && _followDriver) ? 0.0 : _vehicleRotationDeg(heading),
+
+                    flat: !(_followBearing && _followDriver),
                     position: center,
                     icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
                         ? _driverGoogleArrowIcon!
@@ -2077,7 +2086,9 @@ class _MapsState extends State<Maps>
                     userDetails['role'] != 'owner') {
                   myMarkers.add(Marker(
                       markerId: const MarkerId('1'),
-                      rotation: _vehicleRotationDeg(heading),
+                      rotation: (_followBearing && _followDriver) ? 0.0 : _vehicleRotationDeg(heading),
+
+                      flat: !(_followBearing && _followDriver),
                       position: center,
                       icon:
                       (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
@@ -9264,6 +9275,11 @@ class _MapsState extends State<Maps>
     }
 
 
+    final bool _headingUpMode = _followDriver && _followBearing && markerid.toString() == '1';
+    final bool _markerFlat = !_headingUpMode;
+    final double _markerRotation = _headingUpMode ? 0.0 : _vehicleRotationDeg(bearing);
+    final double _bearingToApply = _followBearing ? _wrap360(bearing) : 0.0;
+
     dynamic carMarker;
     if (name == '' && number == '') {
       carMarker = Marker(
@@ -9271,8 +9287,8 @@ class _MapsState extends State<Maps>
           position: LatLng(fromLat, fromLong),
           icon: icon,
           anchor: const Offset(0.5, 0.5),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: _markerFlat,
+          rotation: _markerRotation,
           draggable: false);
     } else {
       carMarker = Marker(
@@ -9281,8 +9297,8 @@ class _MapsState extends State<Maps>
           icon: icon,
           anchor: const Offset(0.5, 0.5),
           infoWindow: InfoWindow(title: number, snippet: name),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: _markerFlat,
+          rotation: _markerRotation,
           draggable: false);
     }
 
@@ -9305,17 +9321,19 @@ class _MapsState extends State<Maps>
 
         LatLng newPos = LatLng(lat, lng);
 
-        // Seguir automáticamente al vehículo en Google Maps
-        if (mapType == 'google' && _controller != null) {
+        // Seguir automáticamente al vehículo en Google Maps (mantener bearing en modo navegación)
+        if (mapType == 'google' &&
+            _controller != null &&
+            _followDriver &&
+            markerid.toString() == '1') {
           try {
-            _controller!.animateCamera(
-              CameraUpdate.newCameraPosition(
-                CameraPosition(
-                  target: newPos,
-                  zoom: 18.0,
-                ),
-              ),
+            final cam = CameraPosition(
+              target: newPos,
+              zoom: _currentZoom,
+              bearing: _bearingToApply,
             );
+            _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+            _cameraBearing = _bearingToApply;
           } catch (_) {}
         }
 
@@ -9327,8 +9345,8 @@ class _MapsState extends State<Maps>
               position: newPos,
               icon: icon,
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: _markerFlat,
+              rotation: _markerRotation,
               draggable: false);
         } else {
           carMarker = Marker(
@@ -9337,8 +9355,8 @@ class _MapsState extends State<Maps>
               icon: icon,
               infoWindow: InfoWindow(title: number, snippet: name),
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: _markerFlat,
+              rotation: _markerRotation,
               draggable: false);
         }
 
