@@ -120,10 +120,12 @@ class _MapsState extends State<Maps>
   LatLng? _uiDisplayLatLng;
   double _uiDisplayHeading = 0.0;
   DateTime? _uiLastTick;
+  DateTime? _uiLastNotifyAt;
   int _offRouteConsecutive = 0;
 
   static const Duration _uiFrameInterval = Duration(milliseconds: 40);
   static const Duration _uiSmoothingWindow = Duration(milliseconds: 280);
+  static const Duration _uiNotifyInterval = Duration(milliseconds: 120);
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -765,11 +767,27 @@ class _MapsState extends State<Maps>
             _shortestAngleDelta(_uiDisplayHeading, _uiTargetHeading) * alpha,
       );
 
+      final moved = geolocator.Geolocator.distanceBetween(
+        current.latitude,
+        current.longitude,
+        nextLat,
+        nextLng,
+      );
+      final headingDelta =
+          _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
+      if (moved < 0.5 && headingDelta < 1.0) {
+        return;
+      }
+
       _uiDisplayLatLng = LatLng(nextLat, nextLng);
       _uiDisplayHeading = nextHeading;
 
       _updateDriverMarker(_uiDisplayLatLng!, _uiDisplayHeading);
-      valueNotifierHome.incrementNotifier();
+      if (_uiLastNotifyAt == null ||
+          now.difference(_uiLastNotifyAt!) >= _uiNotifyInterval) {
+        _uiLastNotifyAt = now;
+        valueNotifierHome.incrementNotifier();
+      }
     });
 
     _uiSmoothingTicker?.start();
@@ -780,6 +798,7 @@ class _MapsState extends State<Maps>
     _uiSmoothingTicker?.dispose();
     _uiSmoothingTicker = null;
     _uiLastTick = null;
+    _uiLastNotifyAt = null;
   }
 
   /// Clear ONLY route polylines (does not touch markers).
