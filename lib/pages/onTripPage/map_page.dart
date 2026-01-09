@@ -121,11 +121,14 @@ class _MapsState extends State<Maps>
   double _uiDisplayHeading = 0.0;
   DateTime? _uiLastTick;
   DateTime? _uiLastNotifyAt;
+  LatLng? _lastCameraTarget;
   int _offRouteConsecutive = 0;
 
   static const Duration _uiFrameInterval = Duration(milliseconds: 40);
   static const Duration _uiSmoothingWindow = Duration(milliseconds: 280);
   static const Duration _uiNotifyInterval = Duration(milliseconds: 120);
+  static const double _cameraMinMoveMeters = 2.5;
+  static const double _cameraMinHeadingDelta = 2.5;
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -667,7 +670,7 @@ class _MapsState extends State<Maps>
         }
         _lastLivePosHandledAt = now;
 
-        final latLng = LatLng(pos.latitude, pos.longitude);
+        final rawLatLng = LatLng(pos.latitude, pos.longitude);
 
         double newHeading;
 
@@ -675,18 +678,18 @@ class _MapsState extends State<Maps>
           final moved = geolocator.Geolocator.distanceBetween(
             _prevDriverLatLng!.latitude,
             _prevDriverLatLng!.longitude,
-            latLng.latitude,
-            latLng.longitude,
+            rawLatLng.latitude,
+            rawLatLng.longitude,
           );
 
           // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
           // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
           if (moved >= 2.0) {
-            newHeading = _bearingBetween(_prevDriverLatLng!, latLng);
+            newHeading = _bearingBetween(_prevDriverLatLng!, rawLatLng);
 
             // Only advance the reference point when movement is real;
             // otherwise small GPS jitter can create random bearings.
-            _prevDriverLatLng = latLng;
+            _prevDriverLatLng = rawLatLng;
           } else {
             newHeading = heading; // keep last stable heading
           }
@@ -695,7 +698,7 @@ class _MapsState extends State<Maps>
           final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
           newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
 
-          _prevDriverLatLng = latLng;
+          _prevDriverLatLng = rawLatLng;
         }
 
         // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
@@ -711,9 +714,15 @@ class _MapsState extends State<Maps>
 
         newHeading = _wrap360(newHeading);
 
-        center = latLng;
-        currentLocation = latLng;
-        heading = newHeading;
+        center = rawLatLng;
+        currentLocation = rawLatLng;
+
+        final hasRoute = polyList.length >= 2;
+        final snap = hasRoute ? _snapToPolyline(rawLatLng, polyList) : null;
+        final snappedLatLng = snap?.position ?? rawLatLng;
+        final snappedHeading = snap?.heading ?? newHeading;
+
+        heading = snappedHeading;
 
         if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
           final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
@@ -724,18 +733,18 @@ class _MapsState extends State<Maps>
           }
         }
 
-        _uiTargetLatLng = latLng;
-        _uiTargetHeading = newHeading;
+        _uiTargetLatLng = snappedLatLng;
+        _uiTargetHeading = snappedHeading;
 
         if (_uiDisplayLatLng == null) {
-          _uiDisplayLatLng = latLng;
-          _uiDisplayHeading = newHeading;
-          _updateDriverMarker(latLng, newHeading);
+          _uiDisplayLatLng = snappedLatLng;
+          _uiDisplayHeading = snappedHeading;
+          _updateDriverMarker(snappedLatLng, snappedHeading);
           valueNotifierHome.incrementNotifier();
         }
 
         if (_followDriver) {
-          _animateToDriver(latLng, newHeading);
+          _animateToDriver(snappedLatLng, snappedHeading);
         }
       });
     } catch (_) {}
@@ -1017,7 +1026,7 @@ class _MapsState extends State<Maps>
                 _driverGoogleArrowIcon != null)
             ? _driverGoogleArrowIcon!
             : icon,
-        rotation: _vehicleRotationDeg(newHeading),
+        rotation: 0.0,
         flat: true,
         anchor: const Offset(0.5, 0.5),
       );
@@ -1036,8 +1045,21 @@ class _MapsState extends State<Maps>
 
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 700) {
+        now.difference(_lastCameraMove!).inMilliseconds < 450) {
       return; // throttle camera work
+    }
+    if (_lastCameraTarget != null) {
+      final moved = geolocator.Geolocator.distanceBetween(
+        _lastCameraTarget!.latitude,
+        _lastCameraTarget!.longitude,
+        latLng.latitude,
+        latLng.longitude,
+      );
+      final headingDelta =
+          _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
+      if (moved < _cameraMinMoveMeters && headingDelta < _cameraMinHeadingDelta) {
+        return;
+      }
     }
     _lastCameraMove = now;
 
@@ -1079,6 +1101,7 @@ class _MapsState extends State<Maps>
     }
 
     _cameraBearing = bearingToApply;
+    _lastCameraTarget = latLng;
   }
 
   double _bearingBetween(LatLng a, LatLng b) {
@@ -1100,6 +1123,60 @@ class _MapsState extends State<Maps>
   double _wrap360(double deg) {
     final v = deg % 360.0;
     return (v < 0) ? (v + 360.0) : v;
+  }
+
+  _SnapResult? _snapToPolyline(LatLng raw, List<LatLng> polylinePoints) {
+    if (polylinePoints.length < 2) return null;
+
+    final rawLatRad = raw.latitude * math.pi / 180.0;
+    final earthRadius = 6371000.0;
+
+    double minDist = double.infinity;
+    LatLng? bestPoint;
+    double bestHeading = heading;
+
+    for (var i = 0; i < polylinePoints.length - 1; i++) {
+      final a = polylinePoints[i];
+      final b = polylinePoints[i + 1];
+      final refLat = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
+
+      final ax = a.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final ay = a.latitude * math.pi / 180.0 * earthRadius;
+      final bx = b.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final by = b.latitude * math.pi / 180.0 * earthRadius;
+      final px = raw.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final py = raw.latitude * math.pi / 180.0 * earthRadius;
+
+      final abx = bx - ax;
+      final aby = by - ay;
+      final apx = px - ax;
+      final apy = py - ay;
+      final abLen2 = (abx * abx) + (aby * aby);
+      if (abLen2 == 0) continue;
+
+      var t = (apx * abx + apy * aby) / abLen2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
+
+      final projx = ax + abx * t;
+      final projy = ay + aby * t;
+
+      final dx = px - projx;
+      final dy = py - projy;
+      final dist = math.sqrt(dx * dx + dy * dy);
+
+      if (dist < minDist) {
+        minDist = dist;
+        final snapLat = (projy / earthRadius) * 180.0 / math.pi;
+        final snapLng =
+            (projx / (earthRadius * math.cos(refLat))) * 180.0 / math.pi;
+        bestPoint = LatLng(snapLat, snapLng);
+        bestHeading = _bearingBetween(a, b);
+      }
+    }
+
+    if (bestPoint == null) return null;
+    return _SnapResult(position: bestPoint, heading: _wrap360(bestHeading));
   }
 
   /// Signed shortest delta from [from] to [to] in degrees (-180..180).
@@ -10332,6 +10409,13 @@ class _MapsState extends State<Maps>
   }
 
 
+}
+
+class _SnapResult {
+  const _SnapResult({required this.position, required this.heading});
+
+  final LatLng position;
+  final double heading;
 }
 
 
