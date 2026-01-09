@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_driver/pages/login/landingpage.dart';
 import 'package:flutter_driver/pages/login/login.dart';
@@ -23,7 +24,6 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'package:permission_handler/permission_handler.dart' as perm;
 import 'package:quick_nav/quick_nav.dart';
-import 'package:vector_math/vector_math.dart' as vector;
 import 'dart:io';
 import '../../functions/functions.dart';
 import '../../functions/geohash.dart';
@@ -32,7 +32,6 @@ import '../../styles/styles.dart';
 import '../../translation/translation.dart';
 import '../../widgets/widgets.dart';
 import '../NavigatorPages/notification.dart';
-import '../NavigatorPages/withdraw.dart';
 import '../NavigatorPages/driverearnings.dart';
 import '../NavigatorPages/history.dart';
 import '../chatPage/chat_page.dart';
@@ -106,15 +105,31 @@ class _MapsState extends State<Maps>
 
 
   // Uber/Didi style: rotate camera to driver heading and keep the car icon pointing "forward" (up) on screen.
-  bool _followBearing = true; // false when user moves the map manually
-  double _currentZoom = 18.0;
+  final bool _followBearing = true; // false when user moves the map manually
+  final double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
+  double _headingDeg = 0.0;
+  double _camBearingDeg = 0.0;
   DateTime _lastCameraMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _prevDriverLatLng;
   DateTime? _lastLivePosHandledAt;
   DateTime? _lastRouteDeviationCheckAt;
-  LatLng? _lastUiDriverLatLng;
-  double _lastUiDriverHeading = 0.0;
+  Ticker? _uiSmoothingTicker;
+  LatLng? _uiTargetLatLng;
+  double _uiTargetHeading = 0.0;
+  LatLng? _uiDisplayLatLng;
+  double _uiDisplayHeading = 0.0;
+  DateTime? _uiLastTick;
+  DateTime? _uiLastNotifyAt;
+  LatLng? _lastCameraTarget;
+  LatLng? _lastSnappedLatLng;
+  int _offRouteConsecutive = 0;
+
+  static const Duration _uiFrameInterval = Duration(milliseconds: 40);
+  static const Duration _uiSmoothingWindow = Duration(milliseconds: 280);
+  static const Duration _uiNotifyInterval = Duration(milliseconds: 120);
+  static const double _cameraMinMoveMeters = 2.5;
+  static const double _cameraMinHeadingDelta = 2.5;
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -645,121 +660,161 @@ class _MapsState extends State<Maps>
           permStatus == geolocator.LocationPermission.deniedForever) {
         return;
       }
+      positionStreamData();
+      _startUiSmoothingTicker();
 
-      final settings = Platform.isAndroid
-          ? const geolocator.AndroidSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              distanceFilter: 10,
-              intervalDuration: Duration(seconds: 5),
-            )
-          : const geolocator.AppleSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              activityType: geolocator.ActivityType.otherNavigation,
-              distanceFilter: 10,
+      _livePosSub = positionStreamUpdates.listen((pos) async {
+        final now = DateTime.now();
+        if (_lastLivePosHandledAt != null &&
+            now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
+          return;
+        }
+        _lastLivePosHandledAt = now;
+
+        final rawLatLng = LatLng(pos.latitude, pos.longitude);
+
+        double newHeading;
+
+        if (_prevDriverLatLng != null) {
+          final moved = geolocator.Geolocator.distanceBetween(
+            _prevDriverLatLng!.latitude,
+            _prevDriverLatLng!.longitude,
+            rawLatLng.latitude,
+            rawLatLng.longitude,
+          );
+
+          // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
+          // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
+          if (moved >= 2.0) {
+            newHeading = _bearingBetween(_prevDriverLatLng!, rawLatLng);
+
+            // Only advance the reference point when movement is real;
+            // otherwise small GPS jitter can create random bearings.
+            _prevDriverLatLng = rawLatLng;
+          } else {
+            newHeading = heading; // keep last stable heading
+          }
+        } else {
+          // First fix: use sensor heading if available (may be 0 / NaN at low speed).
+          final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
+          newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
+
+          _prevDriverLatLng = rawLatLng;
+        }
+
+        // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
+        final sensorHeading2 = (pos.heading.isNaN) ? 0.0 : pos.heading;
+        if (sensorHeading2 != 0.0) {
+          final delta = _shortestAngleDelta(newHeading, sensorHeading2).abs();
+          if (delta <= 20.0) {
+            newHeading = _wrap360(
+              newHeading + _shortestAngleDelta(newHeading, sensorHeading2) * 0.25,
             );
+          }
+        }
 
-      _livePosSub =
-          geolocator.Geolocator.getPositionStream(locationSettings: settings)
-              .listen((pos) async {
-            final now = DateTime.now();
-            if (_lastLivePosHandledAt != null &&
-                now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
-              return;
-            }
-            _lastLivePosHandledAt = now;
+        newHeading = _wrap360(newHeading);
 
-            final latLng = LatLng(pos.latitude, pos.longitude);
+        center = rawLatLng;
+        currentLocation = rawLatLng;
 
-            double newHeading;
+        final hasRoute = polyList.length >= 2;
+        final snap = hasRoute ? _snapToPolyline(rawLatLng, polyList) : null;
+        final snappedLatLng = snap?.position ?? rawLatLng;
+        final snappedHeading = _resolveHeadingTarget(
+          rawLatLng: rawLatLng,
+          fallbackHeading: newHeading,
+          snapHeading: snap?.heading,
+        );
 
-            if (_prevDriverLatLng != null) {
-              final moved = geolocator.Geolocator.distanceBetween(
-                _prevDriverLatLng!.latitude,
-                _prevDriverLatLng!.longitude,
-                latLng.latitude,
-                latLng.longitude,
-              );
+        _headingDeg = _smoothAngle(_headingDeg, snappedHeading, 0.20);
+        heading = _headingDeg;
+        _lastSnappedLatLng = snappedLatLng;
 
-              // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
-              // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
-              if (moved >= 2.0) {
-                newHeading = _bearingBetween(_prevDriverLatLng!, latLng);
+        if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
+          final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
+              now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 12;
+          if (shouldCheckDeviation) {
+            _lastRouteDeviationCheckAt = now;
+            await handleRouteDeviationAndSnap(offRouteMeters: 70);
+          }
+        }
 
-                // Only advance the reference point when movement is real;
-                // otherwise small GPS jitter can create random bearings.
-                _prevDriverLatLng = latLng;
-              } else {
-                newHeading = heading; // keep last stable heading
-              }
-            } else {
-              // First fix: use sensor heading if available (may be 0 / NaN at low speed).
-              final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
-              newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
+        _uiTargetLatLng = snappedLatLng;
+        _uiTargetHeading = _headingDeg;
 
-              _prevDriverLatLng = latLng;
-            }
+        if (_uiDisplayLatLng == null) {
+          _uiDisplayLatLng = snappedLatLng;
+          _uiDisplayHeading = snappedHeading;
+          _updateDriverMarker(snappedLatLng, snappedHeading);
+          valueNotifierHome.incrementNotifier();
+        }
 
-            // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
-            final sensorHeading2 = (pos.heading.isNaN) ? 0.0 : pos.heading;
-            if (sensorHeading2 != 0.0) {
-              final delta = _shortestAngleDelta(newHeading, sensorHeading2).abs();
-              if (delta <= 20.0) {
-                newHeading = _wrap360(
-                  newHeading + _shortestAngleDelta(newHeading, sensorHeading2) * 0.25,
-                );
-              }
-            }
-
-            newHeading = _wrap360(newHeading);
-
-            center = latLng;
-            currentLocation = latLng;
-            heading = newHeading;
-
-            // 🔁 Recalcular y redibujar la ruta en cada update de GPS
-            // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
-            if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
-              final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
-                  now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 4;
-              if (shouldCheckDeviation) {
-                _lastRouteDeviationCheckAt = now;
-                await handleRouteDeviationAndSnap(offRouteMeters: 50);
-              }
-            }
-
-            // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
-
-            final shouldUpdateUi = _shouldUpdateDriverUi(latLng, newHeading);
-            if (shouldUpdateUi) {
-              _lastUiDriverLatLng = latLng;
-              _lastUiDriverHeading = newHeading;
-
-              _updateDriverMarker(latLng, newHeading);
-
-              if (_followDriver) {
-                _animateToDriver(latLng, newHeading);
-              }
-
-              valueNotifierHome.incrementNotifier();
-            }
-          });
+        if (_followDriver) {
+          _animateToDriver(snappedLatLng, snappedHeading);
+        }
+      });
     } catch (_) {}
   }
 
-  bool _shouldUpdateDriverUi(LatLng latLng, double newHeading) {
-    if (_lastUiDriverLatLng == null) return true;
+  void _startUiSmoothingTicker() {
+    if (_uiSmoothingTicker != null) return;
 
-    final moved = geolocator.Geolocator.distanceBetween(
-      _lastUiDriverLatLng!.latitude,
-      _lastUiDriverLatLng!.longitude,
-      latLng.latitude,
-      latLng.longitude,
-    );
+    _uiSmoothingTicker = createTicker((_) {
+      final now = DateTime.now();
+      if (_uiLastTick != null &&
+          now.difference(_uiLastTick!) < _uiFrameInterval) {
+        return;
+      }
+      _uiLastTick = now;
 
-    final headingDelta =
-        _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
+      if (_uiTargetLatLng == null) return;
+      final target = _uiTargetLatLng!;
+      final current = _uiDisplayLatLng ?? target;
 
-    return moved >= 5.0 || headingDelta >= 3.0;
+      final frameMs = _uiFrameInterval.inMilliseconds.toDouble();
+      final smoothMs = _uiSmoothingWindow.inMilliseconds.toDouble();
+      final alpha = (frameMs / smoothMs).clamp(0.08, 1.0);
+
+      final nextLat = current.latitude + (target.latitude - current.latitude) * alpha;
+      final nextLng = current.longitude + (target.longitude - current.longitude) * alpha;
+      final nextHeading = _wrap360(
+        _uiDisplayHeading +
+            _shortestAngleDelta(_uiDisplayHeading, _uiTargetHeading) * alpha,
+      );
+
+      final moved = geolocator.Geolocator.distanceBetween(
+        current.latitude,
+        current.longitude,
+        nextLat,
+        nextLng,
+      );
+      final headingDelta =
+      _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
+      if (moved < 0.5 && headingDelta < 1.0) {
+        return;
+      }
+
+      _uiDisplayLatLng = LatLng(nextLat, nextLng);
+      _uiDisplayHeading = nextHeading;
+
+      _updateDriverMarker(_uiDisplayLatLng!, _uiDisplayHeading);
+      if (_uiLastNotifyAt == null ||
+          now.difference(_uiLastNotifyAt!) >= _uiNotifyInterval) {
+        _uiLastNotifyAt = now;
+        valueNotifierHome.incrementNotifier();
+      }
+    });
+
+    _uiSmoothingTicker?.start();
+  }
+
+  void _stopUiSmoothingTicker() {
+    _uiSmoothingTicker?.stop();
+    _uiSmoothingTicker?.dispose();
+    _uiSmoothingTicker = null;
+    _uiLastTick = null;
+    _uiLastNotifyAt = null;
   }
 
   /// Clear ONLY route polylines (does not touch markers).
@@ -899,7 +954,7 @@ class _MapsState extends State<Maps>
 
   /// If the driver goes off-route by [offRouteMeters], rebuild the route polyline from the current position.
   /// This is throttled to avoid hammering the Directions API.
-  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 50}) async {
+  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 70}) async {
     if (driverReq.isEmpty) return;
     if (polyList.isEmpty) return;
     if (_routeRebuildInProgress) return;
@@ -923,13 +978,21 @@ class _MapsState extends State<Maps>
       if (minD <= offRouteMeters) break;
     }
 
-    if (minD <= offRouteMeters) return;
+    if (minD <= offRouteMeters) {
+      _offRouteConsecutive = 0;
+      return;
+    }
+
+    _offRouteConsecutive += 1;
+    if (_offRouteConsecutive < 2) {
+      return;
+    }
 
     final now = DateTime.now();
     if (_lastRouteRebuildAt != null) {
       final seconds = now.difference(_lastRouteRebuildAt!).inSeconds;
       // Cooldown: avoid rebuilding too often (cost + lag).
-      if (seconds < 8 && minD < offRouteMeters * 3) {
+      if (seconds < 12 && minD < offRouteMeters * 3) {
         return;
       }
     }
@@ -943,6 +1006,7 @@ class _MapsState extends State<Maps>
       // If rebuild fails, keep the current polyline.
     } finally {
       _routeRebuildInProgress = false;
+      _offRouteConsecutive = 0;
     }
   }
 
@@ -950,40 +1014,65 @@ class _MapsState extends State<Maps>
   void _stopLiveDriverTracking() {
     _livePosSub?.cancel();
     _livePosSub = null;
+    _stopUiSmoothingTicker();
   }
 
   void _updateDriverMarker(LatLng latLng, double newHeading) {
     try {
-      myMarkers.removeWhere((m) => m.markerId.value == '1');
-
       final icon = (userDetails['vehicle_type_icon_for'] == 'motor_bike')
           ? pinLocationIcon3
           : (userDetails['vehicle_type_icon_for'] == 'taxi')
           ? pinLocationIcon2
           : pinLocationIcon;
 
-      myMarkers.add(
-        Marker(
-          markerId: const MarkerId('1'),
-          position: latLng,
-          icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
-              ? _driverGoogleArrowIcon!
-              : icon,
-          rotation: _vehicleRotationDeg(newHeading),
-          flat: true,
-          anchor: const Offset(0.5, 0.5),
-        ),
+      // Heading-up mode: when we are following the driver AND bearing-follow is enabled,
+      // keep the arrow pointing up on screen and rotate the map camera instead.
+      final bool headingUpMode = _followDriver && _followBearing;
+      final double rot = headingUpMode ? 0.0 : _vehicleRotationDeg(newHeading);
+      final bool flat = !headingUpMode; // flat=true to apply rotation in north-up mode
+
+      final marker = Marker(
+        markerId: const MarkerId('1'),
+        position: latLng,
+        icon: (mapType == 'google' &&
+            userDetails['role'] == 'driver' &&
+            _driverGoogleArrowIcon != null)
+            ? _driverGoogleArrowIcon!
+            : icon,
+        rotation: rot,
+        flat: flat,
+        anchor: const Offset(0.5, 0.5),
       );
+
+      final index = myMarkers.indexWhere((m) => m.markerId.value == '1');
+      if (index >= 0) {
+        myMarkers[index] = marker;
+      } else {
+        myMarkers.add(marker);
+      }
     } catch (_) {}
   }
+
 
   void _animateToDriver(LatLng latLng, double newHeading) {
     if (_controller == null) return;
 
     final now = DateTime.now();
-    if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 250) {
+    if (now.difference(_lastCameraMove).inMilliseconds < 450) {
       return; // throttle camera work
+    }
+    if (_lastCameraTarget != null) {
+      final moved = geolocator.Geolocator.distanceBetween(
+        _lastCameraTarget!.latitude,
+        _lastCameraTarget!.longitude,
+        latLng.latitude,
+        latLng.longitude,
+      );
+      final headingDelta =
+      _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
+      if (moved < _cameraMinMoveMeters && headingDelta < _cameraMinHeadingDelta) {
+        return;
+      }
     }
     _lastCameraMove = now;
 
@@ -994,22 +1083,20 @@ class _MapsState extends State<Maps>
     bool useMoveCamera = false;
 
     if (_followBearing) {
-      // Smooth + avoid crazy spins near 0/360 and on sharp turns.
-      final delta = _shortestAngleDelta(_cameraBearing, desiredBearing);
+      _camBearingDeg = _smoothAngle(_camBearingDeg, desiredBearing, 0.20);
+      final delta = _shortestAngleDelta(_cameraBearing, _camBearingDeg);
 
-      // Small noise -> ignore.
       if (delta.abs() < 2.0) {
         bearingToApply = _wrap360(_cameraBearing);
       } else if (delta.abs() <= 45.0) {
-        // Smooth small rotations (Uber-like).
-        bearingToApply = _wrap360(_cameraBearing + (delta * 0.35));
+        bearingToApply = _smoothAngle(_cameraBearing, _camBearingDeg, 0.22);
       } else {
-        // Big turns: snap (prevents long wrong spins).
-        bearingToApply = desiredBearing;
+        bearingToApply = _camBearingDeg;
         useMoveCamera = true;
       }
     } else {
       _cameraBearing = 0.0;
+      _camBearingDeg = 0.0;
     }
 
     final cam = CameraPosition(
@@ -1018,13 +1105,20 @@ class _MapsState extends State<Maps>
       bearing: bearingToApply,
     );
 
-    if (useMoveCamera) {
-      _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+    if (mapType == 'google') {
+      if (useMoveCamera) {
+        _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+      } else {
+        _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
+      }
     } else {
-      _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
+      try {
+        _fmController.rotate(bearingToApply);
+      } catch (_) {}
     }
 
     _cameraBearing = bearingToApply;
+    _lastCameraTarget = latLng;
   }
 
   double _bearingBetween(LatLng a, LatLng b) {
@@ -1044,19 +1138,95 @@ class _MapsState extends State<Maps>
   }
 
   double _wrap360(double deg) {
-    final v = deg % 360.0;
-    return (v < 0) ? (v + 360.0) : v;
+    return ((deg % 360.0) + 360.0) % 360.0;
+  }
+
+  _SnapResult? _snapToPolyline(LatLng raw, List<LatLng> polylinePoints) {
+    if (polylinePoints.length < 2) return null;
+
+    final earthRadius = 6371000.0;
+
+    double minDist = double.infinity;
+    LatLng? bestPoint;
+    double bestHeading = heading;
+
+    for (var i = 0; i < polylinePoints.length - 1; i++) {
+      final a = polylinePoints[i];
+      final b = polylinePoints[i + 1];
+      final refLat = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
+
+      final ax = a.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final ay = a.latitude * math.pi / 180.0 * earthRadius;
+      final bx = b.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final by = b.latitude * math.pi / 180.0 * earthRadius;
+      final px = raw.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final py = raw.latitude * math.pi / 180.0 * earthRadius;
+
+      final abx = bx - ax;
+      final aby = by - ay;
+      final apx = px - ax;
+      final apy = py - ay;
+      final abLen2 = (abx * abx) + (aby * aby);
+      if (abLen2 == 0) continue;
+
+      var t = (apx * abx + apy * aby) / abLen2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
+
+      final projx = ax + abx * t;
+      final projy = ay + aby * t;
+
+      final dx = px - projx;
+      final dy = py - projy;
+      final dist = math.sqrt(dx * dx + dy * dy);
+
+      if (dist < minDist) {
+        minDist = dist;
+        final snapLat = (projy / earthRadius) * 180.0 / math.pi;
+        final snapLng =
+            (projx / (earthRadius * math.cos(refLat))) * 180.0 / math.pi;
+        bestPoint = LatLng(snapLat, snapLng);
+        bestHeading = _bearingBetween(a, b);
+      }
+    }
+
+    if (bestPoint == null) return null;
+    return _SnapResult(position: bestPoint, heading: _wrap360(bestHeading));
+  }
+
+  double _shortestAngleDelta(double from, double to) {
+    return ((to - from + 540.0) % 360.0) - 180.0;
+  }
+
+  double _smoothAngle(double current, double target, double alpha) {
+    final delta = _shortestAngleDelta(current, target);
+    return _wrap360(current + (delta * alpha));
+  }
+
+  double _resolveHeadingTarget({
+    required LatLng rawLatLng,
+    required double fallbackHeading,
+    double? snapHeading,
+  }) {
+    if (snapHeading != null) {
+      return _wrap360(snapHeading);
+    }
+    if (_lastSnappedLatLng != null) {
+      final moved = geolocator.Geolocator.distanceBetween(
+        _lastSnappedLatLng!.latitude,
+        _lastSnappedLatLng!.longitude,
+        rawLatLng.latitude,
+        rawLatLng.longitude,
+      );
+      if (moved >= 2.0) {
+        return _wrap360(_bearingBetween(_lastSnappedLatLng!, rawLatLng));
+      }
+    }
+    return _wrap360(fallbackHeading);
   }
 
   /// Signed shortest delta from [from] to [to] in degrees (-180..180).
-  double _shortestAngleDelta(double from, double to) {
-    final a = _wrap360(from);
-    final b = _wrap360(to);
-    var d = b - a;
-    if (d > 180.0) d -= 360.0;
-    if (d < -180.0) d += 360.0;
-    return d;
-  }
+  // (implemented above with modulo math to avoid wrap bugs)
 
 
 
@@ -1492,7 +1662,9 @@ class _MapsState extends State<Maps>
               myMarkers = [
                 Marker(
                     markerId: const MarkerId('1'),
-                    rotation: _vehicleRotationDeg(heading),
+                    rotation: (_followBearing && _followDriver) ? 0.0 : _vehicleRotationDeg(heading),
+
+                    flat: !(_followBearing && _followDriver),
                     position: center,
                     icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
                         ? _driverGoogleArrowIcon!
@@ -1657,26 +1829,26 @@ class _MapsState extends State<Maps>
     // Bottom sheet (on-ride) sizing:
     // - _panelCollapsed: cuánto se esconde cuando está "abajo"
     // - _panelPeekHeight: cuánto queda visible cuando está "abajo" (bajalo para que se vea menos y el mapa se vea más)
-    final double _panelHeight = media.height * 1.2;
-    final double _panelPeekHeight = media.height * 0.10;
-    final double _panelCollapsed = _panelHeight - _panelPeekHeight;
+    final double panelHeight = media.height * 1.2;
+    final double panelPeekHeight = media.height * 0.10;
+    final double panelCollapsed = panelHeight - panelPeekHeight;
 
     // Límite de apertura para que el panel NO tape toda la pantalla:
     // - Con viaje iniciado abrimos más (como tu imagen 3A).
     // - Esperando al cliente abrimos menos (como tu imagen 4A).
-    final bool _tripStarted = (driverReq.isNotEmpty &&
+    final bool tripStarted = (driverReq.isNotEmpty &&
         (driverReq['is_trip_start'] == 1 || driverReq['is_trip_start'] == true));
 
-    final double _panelMaxOpenVisible =
-    _tripStarted ? (media.height * 0.72) : (media.height * 0.42);
+    final double panelMaxOpenVisible =
+    tripStarted ? (media.height * 0.72) : (media.height * 0.42);
 
     // "hidden" mínimo (más chico = más abierto) para que visible nunca supere _panelMaxOpenVisible.
-    final double _panelOpenHidden =
-    (_panelHeight - _panelMaxOpenVisible).clamp(0.0, _panelCollapsed);
+    final double panelOpenHidden =
+    (panelHeight - panelMaxOpenVisible).clamp(0.0, panelCollapsed);
 
-    final double _panelHidden =
-    (addressBottom ?? _panelCollapsed).clamp(_panelOpenHidden, _panelCollapsed);
-    final double _panelVisible = _panelHeight - _panelHidden;
+    final double panelHidden =
+    (addressBottom ?? panelCollapsed).clamp(panelOpenHidden, panelCollapsed);
+    final double panelVisible = panelHeight - panelHidden;
 
     return PopScope(
       canPop: true,
@@ -1686,9 +1858,9 @@ class _MapsState extends State<Maps>
             builder: (context, value, child) {
               // Si cambia el estado de inicio del viaje, refrescamos banderas (pickup/destino)
               // para que siempre se vea la bandera final cuando corresponde.
-              final int _ts = _tripStartValue();
-              if (_ts != _lastTripStartValueMemo) {
-                _lastTripStartValueMemo = _ts;
+              final int ts = _tripStartValue();
+              if (ts != _lastTripStartValueMemo) {
+                _lastTripStartValueMemo = ts;
                 WidgetsBinding.instance.addPostFrameCallback((_) async {
                   if (!mounted) return;
                   await addMarker();
@@ -1911,7 +2083,9 @@ class _MapsState extends State<Maps>
                     userDetails['role'] != 'owner') {
                   myMarkers.add(Marker(
                       markerId: const MarkerId('1'),
-                      rotation: _vehicleRotationDeg(heading),
+                      rotation: (_followBearing && _followDriver) ? 0.0 : _vehicleRotationDeg(heading),
+
+                      flat: !(_followBearing && _followDriver),
                       position: center,
                       icon:
                       (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
@@ -3054,7 +3228,7 @@ class _MapsState extends State<Maps>
                                               mapMarkerStream,
                                               builder: (context,
                                                   snapshot) {
-                                                final bool _bippTopPanelShown =
+                                                final bool bippTopPanelShown =
                                                     userDetails.isNotEmpty &&
                                                         userDetails['role'] != 'owner' &&
                                                         driverReq.isEmpty &&
@@ -3062,8 +3236,8 @@ class _MapsState extends State<Maps>
                                                         (userDetails['low_balance'] != true) &&
                                                         (userDetails['car_make_name'] != null);
 
-                                                final double _bippTopPadding =
-                                                    (_bippTopPanelShown
+                                                final double bippTopPadding =
+                                                    (bippTopPanelShown
                                                         ? (media.height * 0.33)
                                                         : (media.height * 0.10)) +
                                                         MediaQuery.of(context).padding.top;
@@ -3074,9 +3248,9 @@ class _MapsState extends State<Maps>
                                                   },
                                                   padding: EdgeInsets.only(
                                                     bottom: (driverReq['accepted_at'] != null)
-                                                        ? (_panelVisible + MediaQuery.of(context).padding.bottom + 8)
+                                                        ? (panelVisible + MediaQuery.of(context).padding.bottom + 8)
                                                         : (media.width * 1),
-                                                    top: _bippTopPadding,
+                                                    top: bippTopPadding,
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
@@ -4902,7 +5076,7 @@ class _MapsState extends State<Maps>
                                               const Duration(
                                                   milliseconds:
                                                   250),
-                                              bottom: -_panelHidden,
+                                              bottom: -panelHidden,
                                               child:
                                               GestureDetector(
                                                 onVerticalDragStart:
@@ -4910,7 +5084,7 @@ class _MapsState extends State<Maps>
                                                   _cont.jumpTo(0.0);
                                                   start = v.globalPosition.dy;
                                                   // Si está null, lo arrancamos colapsado (bien abajo)
-                                                  addressBottom ??= _panelCollapsed;
+                                                  addressBottom ??= panelCollapsed;
                                                   _addressBottom = addressBottom;
                                                   gesture.clear();
                                                 },
@@ -4918,17 +5092,17 @@ class _MapsState extends State<Maps>
                                                     (v) {
                                                   final double dy = (v.globalPosition.dy - start);
                                                   final double next =
-                                                  (_addressBottom + dy).clamp(_panelOpenHidden, _panelCollapsed).toDouble();
+                                                  (_addressBottom + dy).clamp(panelOpenHidden, panelCollapsed).toDouble();
                                                   setState(() {
                                                     addressBottom = next;
                                                   });
                                                 },
                                                 onVerticalDragEnd:
                                                     (v) {
-                                                  final double current = (addressBottom ?? _panelCollapsed).toDouble();
-                                                  final double mid = (_panelCollapsed + _panelOpenHidden) * 0.5;
+                                                  final double current = (addressBottom ?? panelCollapsed).toDouble();
+                                                  final double mid = (panelCollapsed + panelOpenHidden) * 0.5;
                                                   setState(() {
-                                                    addressBottom = (current > mid) ? _panelCollapsed : _panelOpenHidden;
+                                                    addressBottom = (current > mid) ? panelCollapsed : panelOpenHidden;
                                                   });
                                                 },
                                                 child: Column(
@@ -8496,11 +8670,11 @@ class _MapsState extends State<Maps>
                                               ),
                                             ],
                                           ),
+                                          height: media.width * 0.07,
+                                          width: media.width * 0.08,
                                           child: Center(
                                             child: Icon(Icons.flag, color: Colors.white, size: media.width * 0.045),
                                           ),
-                                          height: media.width * 0.07,
-                                          width: media.width * 0.08,
                                         )
                                       ],
                                     )),
@@ -8592,11 +8766,11 @@ class _MapsState extends State<Maps>
                                                               ),
                                                             ],
                                                           ),
+                                                          height: media.width * 0.07,
+                                                          width: media.width * 0.08,
                                                           child: Center(
                                                             child: Icon(Icons.flag, color: Colors.white, size: media.width * 0.045),
                                                           ),
-                                                          height: media.width * 0.07,
-                                                          width: media.width * 0.08,
                                                         )
                                                       ],
                                                     )
@@ -8674,11 +8848,11 @@ class _MapsState extends State<Maps>
                                                   ),
                                                 ],
                                               ),
+                                              height: media.width * 0.07,
+                                              width: media.width * 0.08,
                                               child: Center(
                                                 child: Icon(Icons.flag, color: Colors.white, size: media.width * 0.045),
                                               ),
-                                              height: media.width * 0.07,
-                                              width: media.width * 0.08,
                                             )
                                           ],
                                         )),
@@ -9098,6 +9272,11 @@ class _MapsState extends State<Maps>
     }
 
 
+    final bool headingUpMode = _followDriver && _followBearing && markerid.toString() == '1';
+    final bool markerFlat = !headingUpMode;
+    final double markerRotation = headingUpMode ? 0.0 : _vehicleRotationDeg(bearing);
+    final double bearingToApply = _followBearing ? _wrap360(bearing) : 0.0;
+
     dynamic carMarker;
     if (name == '' && number == '') {
       carMarker = Marker(
@@ -9105,8 +9284,8 @@ class _MapsState extends State<Maps>
           position: LatLng(fromLat, fromLong),
           icon: icon,
           anchor: const Offset(0.5, 0.5),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: markerFlat,
+          rotation: markerRotation,
           draggable: false);
     } else {
       carMarker = Marker(
@@ -9115,8 +9294,8 @@ class _MapsState extends State<Maps>
           icon: icon,
           anchor: const Offset(0.5, 0.5),
           infoWindow: InfoWindow(title: number, snippet: name),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: markerFlat,
+          rotation: markerRotation,
           draggable: false);
     }
 
@@ -9139,17 +9318,19 @@ class _MapsState extends State<Maps>
 
         LatLng newPos = LatLng(lat, lng);
 
-        // Seguir automáticamente al vehículo en Google Maps
-        if (mapType == 'google' && _controller != null) {
+        // Seguir automáticamente al vehículo en Google Maps (mantener bearing en modo navegación)
+        if (mapType == 'google' &&
+            _controller != null &&
+            _followDriver &&
+            markerid.toString() == '1') {
           try {
-            _controller!.animateCamera(
-              CameraUpdate.newCameraPosition(
-                CameraPosition(
-                  target: newPos,
-                  zoom: 18.0,
-                ),
-              ),
+            final cam = CameraPosition(
+              target: newPos,
+              zoom: _currentZoom,
+              bearing: bearingToApply,
             );
+            _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+            _cameraBearing = bearingToApply;
           } catch (_) {}
         }
 
@@ -9161,8 +9342,8 @@ class _MapsState extends State<Maps>
               position: newPos,
               icon: icon,
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: markerFlat,
+              rotation: markerRotation,
               draggable: false);
         } else {
           carMarker = Marker(
@@ -9171,8 +9352,8 @@ class _MapsState extends State<Maps>
               icon: icon,
               infoWindow: InfoWindow(title: number, snippet: name),
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: markerFlat,
+              rotation: markerRotation,
               draggable: false);
         }
 
@@ -10280,6 +10461,13 @@ class _MapsState extends State<Maps>
 
 }
 
+class _SnapResult {
+  const _SnapResult({required this.position, required this.heading});
+
+  final LatLng position;
+  final double heading;
+}
+
 
 LinearGradient _bippGreenFadeGradient({bool strong = false, double opacity = 1.0}) {
   // Degradé VERDE pero 100% OPACO (sin transparencias) para que se lean las letras
@@ -10751,7 +10939,7 @@ class _BippLaserBorderPainter extends CustomPainter {
 // Pequeña línea ECG para el botón "BUSCANDO VIAJE"
 // =============================================================
 class _BippEcgLine extends StatefulWidget {
-  const _BippEcgLine({super.key});
+  const _BippEcgLine();
 
   @override
   State<_BippEcgLine> createState() => _BippEcgLineState();
