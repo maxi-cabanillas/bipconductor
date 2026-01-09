@@ -110,6 +110,8 @@ class _MapsState extends State<Maps>
   bool _followBearing = true; // false when user moves the map manually
   double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
+  double _headingDeg = 0.0;
+  double _camBearingDeg = 0.0;
   DateTime _lastCameraMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _prevDriverLatLng;
   DateTime? _lastLivePosHandledAt;
@@ -727,7 +729,8 @@ class _MapsState extends State<Maps>
           snapHeading: snap?.heading,
         );
 
-        heading = snappedHeading;
+        _headingDeg = _smoothAngle(_headingDeg, snappedHeading, 0.20);
+        heading = _headingDeg;
         _lastSnappedLatLng = snappedLatLng;
 
         if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
@@ -740,7 +743,7 @@ class _MapsState extends State<Maps>
         }
 
         _uiTargetLatLng = snappedLatLng;
-        _uiTargetHeading = snappedHeading;
+        _uiTargetHeading = _headingDeg;
 
         if (_uiDisplayLatLng == null) {
           _uiDisplayLatLng = snappedLatLng;
@@ -1033,7 +1036,7 @@ class _MapsState extends State<Maps>
             ? _driverGoogleArrowIcon!
             : icon,
         rotation: 0.0,
-        flat: true,
+        flat: false,
         anchor: const Offset(0.5, 0.5),
       );
 
@@ -1076,18 +1079,20 @@ class _MapsState extends State<Maps>
     bool useMoveCamera = false;
 
     if (_followBearing) {
-      final delta = _shortestAngleDelta(_cameraBearing, desiredBearing);
+      _camBearingDeg = _smoothAngle(_camBearingDeg, desiredBearing, 0.20);
+      final delta = _shortestAngleDelta(_cameraBearing, _camBearingDeg);
 
       if (delta.abs() < 2.0) {
         bearingToApply = _wrap360(_cameraBearing);
       } else if (delta.abs() <= 45.0) {
-        bearingToApply = _smoothAngle(_cameraBearing, desiredBearing, 0.22);
+        bearingToApply = _smoothAngle(_cameraBearing, _camBearingDeg, 0.22);
       } else {
-        bearingToApply = desiredBearing;
+        bearingToApply = _camBearingDeg;
         useMoveCamera = true;
       }
     } else {
       _cameraBearing = 0.0;
+      _camBearingDeg = 0.0;
     }
 
     final cam = CameraPosition(
