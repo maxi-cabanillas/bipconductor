@@ -122,6 +122,7 @@ class _MapsState extends State<Maps>
   DateTime? _uiLastTick;
   DateTime? _uiLastNotifyAt;
   LatLng? _lastCameraTarget;
+  LatLng? _lastSnappedLatLng;
   int _offRouteConsecutive = 0;
 
   static const Duration _uiFrameInterval = Duration(milliseconds: 40);
@@ -720,9 +721,14 @@ class _MapsState extends State<Maps>
         final hasRoute = polyList.length >= 2;
         final snap = hasRoute ? _snapToPolyline(rawLatLng, polyList) : null;
         final snappedLatLng = snap?.position ?? rawLatLng;
-        final snappedHeading = snap?.heading ?? newHeading;
+        final snappedHeading = _resolveHeadingTarget(
+          rawLatLng: rawLatLng,
+          fallbackHeading: newHeading,
+          snapHeading: snap?.heading,
+        );
 
         heading = snappedHeading;
+        _lastSnappedLatLng = snappedLatLng;
 
         if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
           final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
@@ -1070,17 +1076,13 @@ class _MapsState extends State<Maps>
     bool useMoveCamera = false;
 
     if (_followBearing) {
-      // Smooth + avoid crazy spins near 0/360 and on sharp turns.
       final delta = _shortestAngleDelta(_cameraBearing, desiredBearing);
 
-      // Small noise -> ignore.
       if (delta.abs() < 2.0) {
         bearingToApply = _wrap360(_cameraBearing);
       } else if (delta.abs() <= 45.0) {
-        // Smooth small rotations (Uber-like).
-        bearingToApply = _wrap360(_cameraBearing + (delta * 0.35));
+        bearingToApply = _smoothAngle(_cameraBearing, desiredBearing, 0.22);
       } else {
-        // Big turns: snap (prevents long wrong spins).
         bearingToApply = desiredBearing;
         useMoveCamera = true;
       }
@@ -1094,10 +1096,16 @@ class _MapsState extends State<Maps>
       bearing: bearingToApply,
     );
 
-    if (useMoveCamera) {
-      _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+    if (mapType == 'google') {
+      if (useMoveCamera) {
+        _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+      } else {
+        _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
+      }
     } else {
-      _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
+      try {
+        _fmController.rotate(bearingToApply);
+      } catch (_) {}
     }
 
     _cameraBearing = bearingToApply;
@@ -1121,14 +1129,12 @@ class _MapsState extends State<Maps>
   }
 
   double _wrap360(double deg) {
-    final v = deg % 360.0;
-    return (v < 0) ? (v + 360.0) : v;
+    return ((deg % 360.0) + 360.0) % 360.0;
   }
 
   _SnapResult? _snapToPolyline(LatLng raw, List<LatLng> polylinePoints) {
     if (polylinePoints.length < 2) return null;
 
-    final rawLatRad = raw.latitude * math.pi / 180.0;
     final earthRadius = 6371000.0;
 
     double minDist = double.infinity;
@@ -1179,15 +1185,39 @@ class _MapsState extends State<Maps>
     return _SnapResult(position: bestPoint, heading: _wrap360(bestHeading));
   }
 
-  /// Signed shortest delta from [from] to [to] in degrees (-180..180).
   double _shortestAngleDelta(double from, double to) {
-    final a = _wrap360(from);
-    final b = _wrap360(to);
-    var d = b - a;
-    if (d > 180.0) d -= 360.0;
-    if (d < -180.0) d += 360.0;
-    return d;
+    return ((to - from + 540.0) % 360.0) - 180.0;
   }
+
+  double _smoothAngle(double current, double target, double alpha) {
+    final delta = _shortestAngleDelta(current, target);
+    return _wrap360(current + (delta * alpha));
+  }
+
+  double _resolveHeadingTarget({
+    required LatLng rawLatLng,
+    required double fallbackHeading,
+    double? snapHeading,
+  }) {
+    if (snapHeading != null) {
+      return _wrap360(snapHeading);
+    }
+    if (_lastSnappedLatLng != null) {
+      final moved = geolocator.Geolocator.distanceBetween(
+        _lastSnappedLatLng!.latitude,
+        _lastSnappedLatLng!.longitude,
+        rawLatLng.latitude,
+        rawLatLng.longitude,
+      );
+      if (moved >= 2.0) {
+        return _wrap360(_bearingBetween(_lastSnappedLatLng!, rawLatLng));
+      }
+    }
+    return _wrap360(fallbackHeading);
+  }
+
+  /// Signed shortest delta from [from] to [to] in degrees (-180..180).
+  // (implemented above with modulo math to avoid wrap bugs)
 
 
 
