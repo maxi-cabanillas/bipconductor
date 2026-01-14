@@ -5217,20 +5217,21 @@ Stream<geolocs.Position> get positionStreamUpdates =>
 
 geolocs.LocationSettings locationSettings = (platform == TargetPlatform.android)
     ? geolocs.AndroidSettings(
-    accuracy: geolocs.LocationAccuracy.high,
-    distanceFilter: 10,
-    intervalDuration: const Duration(seconds: 5),
-    foregroundNotificationConfig:
-    const geolocs.ForegroundNotificationConfig(
-      notificationText:
-      "Product Name will continue to receive your location in background",
-      notificationTitle: "Location background service running",
-      enableWakeLock: true,
-    ))
+  // Defaults agresivos para navegación (el modo exacto se ajusta con updateDriverLocationSettings).
+  accuracy: geolocs.LocationAccuracy.bestForNavigation,
+  distanceFilter: 2,
+  intervalDuration: const Duration(seconds: 1),
+  foregroundNotificationConfig: const geolocs.ForegroundNotificationConfig(
+    notificationText:
+    "Product Name will continue to receive your location in background",
+    notificationTitle: "Location background service running",
+    enableWakeLock: true,
+  ),
+)
     : geolocs.AppleSettings(
-  accuracy: geolocs.LocationAccuracy.high,
+  accuracy: geolocs.LocationAccuracy.bestForNavigation,
   activityType: geolocs.ActivityType.otherNavigation,
-  distanceFilter: 10,
+  distanceFilter: 4,
   showBackgroundLocationIndicator: true,
 );
 
