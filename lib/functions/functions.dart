@@ -1864,26 +1864,26 @@ currentPositionUpdate() async {
 
   _firebaseLocationTimer =
       Timer.periodic(kFirebaseLocationTick, (timer) async {
-    if (userDetails.isEmpty || userDetails['role'] != 'driver') {
-      return;
-    }
-    if (center == null) return;
+        if (userDetails.isEmpty || userDetails['role'] != 'driver') {
+          return;
+        }
+        if (center == null) return;
 
-    try {
-      final firebase = FirebaseDatabase.instance.ref();
-      await firebase.child('drivers/driver_${userDetails['id']}').update({
-        'bearing': heading,
-        'lat': center.latitude,
-        'lng': center.longitude,
-        'ts': DateTime.now().millisecondsSinceEpoch,
-        'updated_at': ServerValue.timestamp,
+        try {
+          final firebase = FirebaseDatabase.instance.ref();
+          await firebase.child('drivers/driver_${userDetails['id']}').update({
+            'bearing': heading,
+            'lat': center.latitude,
+            'lng': center.longitude,
+            'ts': DateTime.now().millisecondsSinceEpoch,
+            'updated_at': ServerValue.timestamp,
+          });
+        } catch (e) {
+          if (e is SocketException) {
+            internet = false;
+          }
+        }
       });
-    } catch (e) {
-      if (e is SocketException) {
-        internet = false;
-      }
-    }
-  });
 
   _positionUpdateTimer = Timer.periodic(kDriverPositionTick, (timer) async {
     final tickNow = DateTime.now();
@@ -5211,28 +5211,28 @@ adminmessageseen() async {
 bool positionStreamStarted = false;
 StreamSubscription<geolocs.Position>? positionStream;
 final StreamController<geolocs.Position> _positionStreamController =
-    StreamController<geolocs.Position>.broadcast();
+StreamController<geolocs.Position>.broadcast();
 Stream<geolocs.Position> get positionStreamUpdates =>
     _positionStreamController.stream;
 
 geolocs.LocationSettings locationSettings = (platform == TargetPlatform.android)
     ? geolocs.AndroidSettings(
-        accuracy: geolocs.LocationAccuracy.high,
-        distanceFilter: 10,
-        intervalDuration: const Duration(seconds: 5),
-        foregroundNotificationConfig:
-            const geolocs.ForegroundNotificationConfig(
-          notificationText:
-              "Product Name will continue to receive your location in background",
-          notificationTitle: "Location background service running",
-          enableWakeLock: true,
-        ))
+    accuracy: geolocs.LocationAccuracy.high,
+    distanceFilter: 10,
+    intervalDuration: const Duration(seconds: 5),
+    foregroundNotificationConfig:
+    const geolocs.ForegroundNotificationConfig(
+      notificationText:
+      "Product Name will continue to receive your location in background",
+      notificationTitle: "Location background service running",
+      enableWakeLock: true,
+    ))
     : geolocs.AppleSettings(
-        accuracy: geolocs.LocationAccuracy.high,
-        activityType: geolocs.ActivityType.otherNavigation,
-        distanceFilter: 10,
-        showBackgroundLocationIndicator: true,
-      );
+  accuracy: geolocs.LocationAccuracy.high,
+  activityType: geolocs.ActivityType.otherNavigation,
+  distanceFilter: 10,
+  showBackgroundLocationIndicator: true,
+);
 
 String _locationSettingsKey = '';
 DateTime? _locationBoostUntil;
@@ -5243,11 +5243,16 @@ void updateDriverLocationSettings({
   required double accuracy,
 }) {
   final now = DateTime.now();
+  final bool isDriver = userDetails['role'] == 'driver';
+  final dynamic _activeVal = userDetails['active'];
+  final dynamic _availVal = userDetails['available'];
+  final bool isActive = _activeVal == true || _activeVal == 1 || _activeVal == '1';
+  final bool isAvailable = _availVal == true || _availVal == 1 || _availVal == '1';
+  final bool isOnlineDriver = isDriver && (isActive || isAvailable);
+
   final mode = onTrip
       ? 'trip'
-      : (speed >= 1.5)
-          ? 'moving'
-          : 'idle';
+      : (isOnlineDriver ? 'available' : (speed >= 1.5 ? 'moving' : 'idle'));
   if (accuracy > 25.0 && speed > 3.0) {
     _locationBoostUntil = now.add(const Duration(seconds: 15));
   }
@@ -5261,23 +5266,27 @@ void updateDriverLocationSettings({
         ? geolocs.LocationAccuracy.bestForNavigation
         : geolocs.LocationAccuracy.high;
     final Duration interval = (mode == 'trip')
+        ? const Duration(seconds: 1)
+        : (mode == 'available')
+        ? const Duration(seconds: 1)
+        : (mode == 'moving')
         ? const Duration(seconds: 2)
-        : (mode == 'moving')
-            ? const Duration(seconds: 3)
-            : const Duration(seconds: 10);
+        : const Duration(seconds: 10);
     final int distanceFilter = (mode == 'trip')
-        ? 4
+        ? 2
+        : (mode == 'available')
+        ? 2
         : (mode == 'moving')
-            ? 8
-            : 25;
+        ? 5
+        : 25;
     locationSettings = geolocs.AndroidSettings(
       accuracy: accuracySetting,
       distanceFilter: distanceFilter,
       intervalDuration: interval,
       foregroundNotificationConfig:
-          const geolocs.ForegroundNotificationConfig(
+      const geolocs.ForegroundNotificationConfig(
         notificationText:
-            "Product Name will continue to receive your location in background",
+        "Product Name will continue to receive your location in background",
         notificationTitle: "Location background service running",
         enableWakeLock: true,
       ),
@@ -5289,8 +5298,8 @@ void updateDriverLocationSettings({
     final int distanceFilter = (mode == 'trip')
         ? 4
         : (mode == 'moving')
-            ? 8
-            : 25;
+        ? 8
+        : 25;
     locationSettings = geolocs.AppleSettings(
       accuracy: accuracySetting,
       activityType: geolocs.ActivityType.otherNavigation,

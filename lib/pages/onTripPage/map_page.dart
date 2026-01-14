@@ -108,6 +108,19 @@ class _MapsState extends State<Maps>
 
   // Uber/Didi style: rotate camera to driver heading and keep the car icon pointing "forward" (up) on screen.
   bool _followBearing = true; // false when user moves the map manually
+
+  // Used to ignore onCameraMoveStarted events triggered by our own animate/move camera calls.
+  DateTime? _programmaticCameraMoveUntil;
+  DateTime? _mapCreatedAt;
+  void _markProgrammaticCameraMove([Duration d = const Duration(milliseconds: 1200)]) {
+    _programmaticCameraMoveUntil = DateTime.now().add(d);
+  }
+
+  bool _isProgrammaticCameraMove() {
+    final until = _programmaticCameraMoveUntil;
+    return until != null && DateTime.now().isBefore(until);
+  }
+
   double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
   double _headingDeg = 0.0;
@@ -132,8 +145,8 @@ class _MapsState extends State<Maps>
   DateTime? _lastDebugAt;
   int _offRouteConsecutive = 0;
 
-  static const Duration _uiFrameInterval = Duration(milliseconds: 300);
-  static const Duration _uiSmoothingWindow = Duration(milliseconds: 280);
+  static const Duration _uiFrameInterval = Duration(milliseconds: 100);
+  static const Duration _uiSmoothingWindow = Duration(milliseconds: 1200);
   static const Duration _uiNotifyInterval = Duration(milliseconds: 300);
   static const double _cameraMinMoveMeters = 2.5;
   static const double _cameraMinHeadingDelta = 2.5;
@@ -565,6 +578,7 @@ class _MapsState extends State<Maps>
     setState(() {
       _controller = controller;
       _controller?.setMapStyle(mapStyle);
+      _mapCreatedAt = DateTime.now();
     });
     if ((choosenRide.isNotEmpty || driverReq.isNotEmpty) &&
         _pickAnimateDone == false) {
@@ -771,23 +785,23 @@ class _MapsState extends State<Maps>
           final uiLag = (_uiDisplayLatLng == null)
               ? 0.0
               : geolocator.Geolocator.distanceBetween(
-                  _uiDisplayLatLng!.latitude,
-                  _uiDisplayLatLng!.longitude,
-                  snappedLatLng.latitude,
-                  snappedLatLng.longitude,
-                );
+            _uiDisplayLatLng!.latitude,
+            _uiDisplayLatLng!.longitude,
+            snappedLatLng.latitude,
+            snappedLatLng.longitude,
+          );
           final ageMs = (pos.timestamp == null)
               ? 0
               : now.difference(pos.timestamp!).inMilliseconds;
           final modeLabel = (driverReq.isNotEmpty && driverReq['accepted_at'] != null)
               ? 'trip'
               : (pos.speed >= 1.5)
-                  ? 'moving'
-                  : 'idle';
+              ? 'moving'
+              : 'idle';
           debugPrint(
               'loc dbg mode=$modeLabel acc=${pos.accuracy.toStringAsFixed(1)}m '
-              'speed=${pos.speed.toStringAsFixed(2)}m/s age=${ageMs}ms '
-              'uiLag=${uiLag.toStringAsFixed(1)}m');
+                  'speed=${pos.speed.toStringAsFixed(2)}m/s age=${ageMs}ms '
+                  'uiLag=${uiLag.toStringAsFixed(1)}m');
         }
       });
     } catch (_) {}
@@ -814,7 +828,7 @@ class _MapsState extends State<Maps>
             now.difference(_lastFixAt!).inMilliseconds / 1000.0;
         if (dtSeconds > 0) {
           final predictedMeters =
-              (_lastFixSpeed * dtSeconds).clamp(0.0, _maxPredictionMeters);
+          (_lastFixSpeed * dtSeconds).clamp(0.0, _maxPredictionMeters);
           if (predictedMeters > 0.5) {
             targetForFrame = _projectLatLng(
               _lastFixLatLng!,
@@ -845,7 +859,7 @@ class _MapsState extends State<Maps>
         targetForFrame.longitude,
       );
       final headingDelta =
-        _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
+      _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
       if (moved < 0.5 && headingDelta < 1.0) {
         return;
       }
@@ -1000,6 +1014,7 @@ class _MapsState extends State<Maps>
 
     final z = zoom ?? _currentZoom ?? 16;
     try {
+      _markProgrammaticCameraMove();
       await _controller!.animateCamera(
         CameraUpdate.newCameraPosition(
           CameraPosition(
@@ -1088,8 +1103,8 @@ class _MapsState extends State<Maps>
         markerId: const MarkerId('1'),
         position: latLng,
         icon: (mapType == 'google' &&
-                userDetails['role'] == 'driver' &&
-                _driverGoogleArrowIcon != null)
+            userDetails['role'] == 'driver' &&
+            _driverGoogleArrowIcon != null)
             ? _driverGoogleArrowIcon!
             : icon,
         rotation: 0.0,
@@ -1122,7 +1137,7 @@ class _MapsState extends State<Maps>
         latLng.longitude,
       );
       final headingDelta =
-          _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
+      _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
       if (moved < _cameraMinMoveMeters && headingDelta < _cameraMinHeadingDelta) {
         return;
       }
@@ -1160,8 +1175,12 @@ class _MapsState extends State<Maps>
 
     if (mapType == 'google') {
       if (useMoveCamera) {
+        _markProgrammaticCameraMove();
+
         _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
       } else {
+        _markProgrammaticCameraMove();
+
         _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
       }
     } else {
@@ -1733,7 +1752,8 @@ class _MapsState extends State<Maps>
               myMarkers = [
                 Marker(
                     markerId: const MarkerId('1'),
-                    rotation: _vehicleRotationDeg(heading),
+                    rotation: (mapType == 'google' && userDetails['role'] == 'driver') ? 0.0 : _vehicleRotationDeg(heading),
+                    flat: (mapType == 'google' && userDetails['role'] == 'driver') ? false : true,
                     position: center,
                     icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
                         ? _driverGoogleArrowIcon!
@@ -1797,6 +1817,7 @@ class _MapsState extends State<Maps>
             northeast: LatLng(driverReq['drop_lat'], driverReq['drop_lng']));
       }
       CameraUpdate cameraUpdate = CameraUpdate.newLatLngBounds(bound, 100);
+      _markProgrammaticCameraMove();
       _controller?.animateCamera(cameraUpdate);
     } else if (driverReq.isNotEmpty) {
       if (center.latitude > driverReq['pick_lat'] &&
@@ -1818,6 +1839,7 @@ class _MapsState extends State<Maps>
             northeast: LatLng(driverReq['pick_lat'], driverReq['pick_lng']));
       }
       CameraUpdate cameraUpdate = CameraUpdate.newLatLngBounds(bound, 100);
+      _markProgrammaticCameraMove();
       _controller?.animateCamera(cameraUpdate);
     }
   }
@@ -2152,7 +2174,8 @@ class _MapsState extends State<Maps>
                     userDetails['role'] != 'owner') {
                   myMarkers.add(Marker(
                       markerId: const MarkerId('1'),
-                      rotation: _vehicleRotationDeg(heading),
+                      rotation: (mapType == 'google' && userDetails['role'] == 'driver') ? 0.0 : _vehicleRotationDeg(heading),
+                      flat: (mapType == 'google' && userDetails['role'] == 'driver') ? false : true,
                       position: center,
                       icon:
                       (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
@@ -3321,6 +3344,27 @@ class _MapsState extends State<Maps>
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
+                                                  onCameraMoveStarted: () {
+                                                    // Ignore camera moves during initial map settle, and ignore moves we triggered ourselves.
+                                                    final createdAt = _mapCreatedAt;
+                                                    if (createdAt != null &&
+                                                        DateTime.now().difference(createdAt).inMilliseconds < 1500) {
+                                                      return;
+                                                    }
+                                                    if (_isProgrammaticCameraMove()) return;
+
+                                                    // User is interacting with the map: stop auto-following the camera.
+                                                    if (mounted) {
+                                                      setState(() {
+                                                        _followDriver = false;
+                                                      });
+                                                    } else {
+                                                      _followDriver = false;
+                                                    }
+                                                  },
+                                                  onCameraIdle: () {
+                                                    // Keep follow off until the user taps the re-center button.
+                                                  },
                                                   initialCameraPosition:
                                                   CameraPosition(
                                                     target: (center ==
@@ -9330,6 +9374,8 @@ class _MapsState extends State<Maps>
     getBearing(LatLng(fromLat, fromLong), LatLng(toLat, toLong));
 
 
+
+    final bool _headingUpDriverMarker = (mapType == 'google' && markerid.toString() == '1' && userDetails['role'] == 'driver');
     // Force Google-style blue arrow for the driver's own marker (id '1')
     if (mapType == 'google' && markerid.toString() == '1' && userDetails['role'] == 'driver') {
       await _ensureDriverGoogleArrowIcon();
@@ -9346,8 +9392,8 @@ class _MapsState extends State<Maps>
           position: LatLng(fromLat, fromLong),
           icon: icon,
           anchor: const Offset(0.5, 0.5),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: _headingUpDriverMarker ? false : true,
+          rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
           draggable: false);
     } else {
       carMarker = Marker(
@@ -9356,8 +9402,8 @@ class _MapsState extends State<Maps>
           icon: icon,
           anchor: const Offset(0.5, 0.5),
           infoWindow: InfoWindow(title: number, snippet: name),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: _headingUpDriverMarker ? false : true,
+          rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
           draggable: false);
     }
 
@@ -9379,21 +9425,6 @@ class _MapsState extends State<Maps>
         double lat = v * toLat + (1 - v) * fromLat;
 
         LatLng newPos = LatLng(lat, lng);
-
-        // Seguir automáticamente al vehículo en Google Maps
-        if (mapType == 'google' && _controller != null) {
-          try {
-            _controller!.animateCamera(
-              CameraUpdate.newCameraPosition(
-                CameraPosition(
-                  target: newPos,
-                  zoom: 18.0,
-                ),
-              ),
-            );
-          } catch (_) {}
-        }
-
         //New marker location
 
         if (name == '' && number == '') {
@@ -9402,8 +9433,8 @@ class _MapsState extends State<Maps>
               position: newPos,
               icon: icon,
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: _headingUpDriverMarker ? false : true,
+              rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
               draggable: false);
         } else {
           carMarker = Marker(
@@ -9412,8 +9443,8 @@ class _MapsState extends State<Maps>
               icon: icon,
               infoWindow: InfoWindow(title: number, snippet: name),
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: _headingUpDriverMarker ? false : true,
+              rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
               draggable: false);
         }
 
@@ -9435,6 +9466,8 @@ class _MapsState extends State<Maps>
               .firstWhere((element) => element.markerId == MarkerId(markerid))
               .position)) {
           } else {
+            _markProgrammaticCameraMove();
+
             _controller.animateCamera(CameraUpdate.newLatLng(center));
           }
         });
