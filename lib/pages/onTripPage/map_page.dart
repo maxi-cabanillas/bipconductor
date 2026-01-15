@@ -112,9 +112,6 @@ class _MapsState extends State<Maps>
   // Used to ignore onCameraMoveStarted events triggered by our own animate/move camera calls.
   DateTime? _programmaticCameraMoveUntil;
   DateTime? _mapCreatedAt;
-  // When the user drags/zooms the map, pause auto-follow for a short time and then resume (on trip).
-  DateTime? _userGestureHoldUntil;
-
   void _markProgrammaticCameraMove([Duration d = const Duration(milliseconds: 1200)]) {
     _programmaticCameraMoveUntil = DateTime.now().add(d);
   }
@@ -141,7 +138,6 @@ class _MapsState extends State<Maps>
   DateTime? _uiLastNotifyAt;
   LatLng? _lastCameraTarget;
   LatLng? _lastSnappedLatLng;
-  int _lastSnapSegIndex = 0; // para acelerar el snap a la polilínea (evita recorrer miles de puntos)
   LatLng? _lastFixLatLng;
   DateTime? _lastFixAt;
   double _lastFixSpeed = 0.0;
@@ -430,71 +426,31 @@ class _MapsState extends State<Maps>
 
 
   Future<void> _ensureDriverGoogleArrowIcon() async {
+    // En esta app, este BitmapDescriptor se usa como "icono del conductor" en Google Maps.
+    // Antes estaba dibujando una flecha con Canvas; ahora cargamos el auto F1 desde assets.
     if (_driverGoogleArrowIcon != null) return;
 
-    const int size = 110; // px (sharp enough on most screens)
-    final ui.PictureRecorder recorder = ui.PictureRecorder();
-    final Canvas canvas = Canvas(recorder);
-    final double s = size.toDouble();
+    const String assetPath = 'assets/icons/driver_f1_256.png';
+    const int targetPx = 92; // <-- tamaño final del autito (subí a 190 si lo querés más grande)
 
-    // Shadow
-    final Paint shadow = Paint()
-      ..color = const Color(0x66000000)
-      ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 10);
+    try {
+      final byteData = await rootBundle.load(assetPath);
+      final codec = await ui.instantiateImageCodec(
+        byteData.buffer.asUint8List(),
+        targetWidth: targetPx,
+        targetHeight: targetPx,
+      );
+      final frame = await codec.getNextFrame();
+      final pngBytes =
+      await frame.image.toByteData(format: ui.ImageByteFormat.png);
+      if (pngBytes == null) return;
 
-    // Outer (white) shape
-    final Paint outer = Paint()..color = Colors.white;
-
-    // Inner (Google blue) shape
-    final Paint inner = Paint()..color = const Color(0xFF1A73E8);
-
-    // Arrow path (points UP by default)
-    final Path arrow = Path()
-      ..moveTo(s * 0.50, s * 0.06)
-      ..lineTo(s * 0.88, s * 0.92)
-      ..lineTo(s * 0.50, s * 0.76)
-      ..lineTo(s * 0.12, s * 0.92)
-      ..close();
-
-    // Draw shadow (slight down-right)
-    canvas.save();
-    canvas.translate(2, 3);
-    canvas.drawPath(arrow, shadow);
-    canvas.restore();
-
-    // Draw white border by drawing a slightly larger arrow behind
-    canvas.save();
-    canvas.translate(s * 0.50, s * 0.55);
-    canvas.scale(1.06, 1.06);
-    canvas.translate(-s * 0.50, -s * 0.55);
-    canvas.drawPath(arrow, outer);
-    canvas.restore();
-
-    // Draw blue arrow on top
-    canvas.drawPath(arrow, inner);
-
-    // Tiny highlight (gives a "Google" feel)
-    final Paint highlight = Paint()
-      ..color = const Color(0x3329B6F6)
-      ..style = PaintingStyle.fill;
-
-    final Path hl = Path()
-      ..moveTo(s * 0.50, s * 0.12)
-      ..lineTo(s * 0.75, s * 0.86)
-      ..lineTo(s * 0.50, s * 0.72)
-      ..lineTo(s * 0.25, s * 0.86)
-      ..close();
-
-    canvas.drawPath(hl, highlight);
-
-    final ui.Image img = await recorder.endRecording().toImage(size, size);
-    final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
-    if (byteData == null) return;
-
-    _driverGoogleArrowIcon =
-        BitmapDescriptor.fromBytes(byteData.buffer.asUint8List());
-
-    if (mounted) setState(() {});
+      _driverGoogleArrowIcon = BitmapDescriptor.fromBytes(
+        pngBytes.buffer.asUint8List(),
+      );
+    } catch (_) {
+      // Si el asset no existe o falla la carga, dejamos null para que el marker use el icono por defecto (pinLocationIcon*).
+    }
   }
 
 
@@ -762,10 +718,10 @@ class _MapsState extends State<Maps>
 
         if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
           final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
-              now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 3;
+              now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 12;
           if (shouldCheckDeviation) {
             _lastRouteDeviationCheckAt = now;
-            handleRouteDeviationAndSnap(offRouteMeters: 45); // no-await: no bloquea el stream de GPS
+            await handleRouteDeviationAndSnap(offRouteMeters: 70);
           }
         }
 
@@ -777,15 +733,6 @@ class _MapsState extends State<Maps>
           _uiDisplayHeading = _headingDeg;
           _updateDriverMarker(snappedLatLng, _headingDeg);
           valueNotifierHome.incrementNotifier();
-        }
-
-        // Auto re-follow (tipo DiDi): si el usuario tocó el mapa, pausamos unos segundos y luego volvemos a centrar/rotar.
-        final bool onTripNow = driverReq.isNotEmpty && driverReq['accepted_at'] != null;
-        if (onTripNow && !_followDriver) {
-          final holdUntil = _userGestureHoldUntil;
-          if (holdUntil == null || now.isAfter(holdUntil)) {
-            _followDriver = true;
-          }
         }
 
         if (_followDriver) {
@@ -1041,7 +988,7 @@ class _MapsState extends State<Maps>
 
   /// If the driver goes off-route by [offRouteMeters], rebuild the route polyline from the current position.
   /// This is throttled to avoid hammering the Directions API.
-  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 45}) async {
+  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 70}) async {
     if (driverReq.isEmpty) return;
     if (polyList.isEmpty) return;
     if (_routeRebuildInProgress) return;
@@ -1079,7 +1026,7 @@ class _MapsState extends State<Maps>
     if (_lastRouteRebuildAt != null) {
       final seconds = now.difference(_lastRouteRebuildAt!).inSeconds;
       // Cooldown: avoid rebuilding too often (cost + lag).
-      if (seconds < 5 && minD < offRouteMeters * 3) {
+      if (seconds < 12 && minD < offRouteMeters * 3) {
         return;
       }
     }
@@ -1112,18 +1059,15 @@ class _MapsState extends State<Maps>
           ? pinLocationIcon2
           : pinLocationIcon;
 
-      final bool useGoogleArrow = (mapType == 'google' &&
-          userDetails['role'] == 'driver' &&
-          _driverGoogleArrowIcon != null);
-
-      // En modo navegación: la cámara rota y el marcador rota igual (heading) => visualmente queda siempre "hacia arriba".
-      final double rot = _vehicleRotationDeg(newHeading);
-
       final marker = Marker(
         markerId: const MarkerId('1'),
         position: latLng,
-        icon: useGoogleArrow ? _driverGoogleArrowIcon! : icon,
-        rotation: rot,
+        icon: (mapType == 'google' &&
+            userDetails['role'] == 'driver' &&
+            _driverGoogleArrowIcon != null)
+            ? _driverGoogleArrowIcon!
+            : icon,
+        rotation: _vehicleRotationDeg(newHeading),
         flat: true,
         anchor: const Offset(0.5, 0.5),
       );
@@ -1140,11 +1084,9 @@ class _MapsState extends State<Maps>
   void _animateToDriver(LatLng latLng, double newHeading) {
     if (_controller == null) return;
 
-    final bool onTrip = driverReq.isNotEmpty && driverReq['accepted_at'] != null;
-
     final now = DateTime.now();
-    final int throttleMs = onTrip ? 220 : 450;
-    if (now.difference(_lastCameraMove).inMilliseconds < throttleMs) {
+    if (_lastCameraMove != null &&
+        now.difference(_lastCameraMove!).inMilliseconds < 450) {
       return; // throttle camera work
     }
     if (_lastCameraTarget != null) {
@@ -1156,11 +1098,7 @@ class _MapsState extends State<Maps>
       );
       final headingDelta =
       _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
-
-      final double minMove = onTrip ? 0.4 : _cameraMinMoveMeters;
-      final double minHeading = onTrip ? 1.0 : _cameraMinHeadingDelta;
-
-      if (moved < minMove && headingDelta < minHeading) {
+      if (moved < _cameraMinMoveMeters && headingDelta < _cameraMinHeadingDelta) {
         return;
       }
     }
@@ -1168,8 +1106,9 @@ class _MapsState extends State<Maps>
 
     // Keep zoom stable unless you change it elsewhere.
     final desiredBearing = _followBearing ? _wrap360(newHeading) : 0.0;
+
     double bearingToApply = desiredBearing;
-    bool useMoveCamera = onTrip; // navegación: preferimos moveCamera (más fluido / menos cola de animaciones)
+    bool useMoveCamera = false;
 
     if (_followBearing) {
       _camBearingDeg = _smoothAngle(_camBearingDeg, desiredBearing, 0.20);
@@ -1184,7 +1123,8 @@ class _MapsState extends State<Maps>
         useMoveCamera = true;
       }
     } else {
-      bearingToApply = 0.0;
+      _cameraBearing = 0.0;
+      _camBearingDeg = 0.0;
     }
 
     final cam = CameraPosition(
@@ -1194,13 +1134,13 @@ class _MapsState extends State<Maps>
     );
 
     if (mapType == 'google') {
-      _markProgrammaticCameraMove(onTrip
-          ? const Duration(milliseconds: 800)
-          : const Duration(milliseconds: 1200));
-
       if (useMoveCamera) {
+        _markProgrammaticCameraMove();
+
         _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
       } else {
+        _markProgrammaticCameraMove();
+
         _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
       }
     } else {
@@ -1252,85 +1192,56 @@ class _MapsState extends State<Maps>
   }
 
   _SnapResult? _snapToPolyline(LatLng raw, List<LatLng> polylinePoints) {
-    final n = polylinePoints.length;
-    if (n < 2) return null;
+    if (polylinePoints.length < 2) return null;
 
     final earthRadius = 6371000.0;
 
     double minDist = double.infinity;
     LatLng? bestPoint;
     double bestHeading = heading;
-    int bestIndex = 0;
 
-    // Búsqueda rápida alrededor del último segmento (modo navegación).
-    int start = 0;
-    int end = n - 2;
-    if (_lastSnapSegIndex > 0 && _lastSnapSegIndex < n - 1) {
-      const int window = 80;
-      start = math.max(0, _lastSnapSegIndex - window);
-      end = math.min(n - 2, _lastSnapSegIndex + window);
-    }
+    for (var i = 0; i < polylinePoints.length - 1; i++) {
+      final a = polylinePoints[i];
+      final b = polylinePoints[i + 1];
+      final refLat = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
 
-    void evalRange(int s, int e, int step) {
-      for (var i = s; i <= e; i += step) {
-        final a = polylinePoints[i];
-        final b = polylinePoints[i + 1];
-        final refLat = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
+      final ax = a.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final ay = a.latitude * math.pi / 180.0 * earthRadius;
+      final bx = b.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final by = b.latitude * math.pi / 180.0 * earthRadius;
+      final px = raw.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final py = raw.latitude * math.pi / 180.0 * earthRadius;
 
-        final ax = a.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
-        final ay = a.latitude * math.pi / 180.0 * earthRadius;
-        final bx = b.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
-        final by = b.latitude * math.pi / 180.0 * earthRadius;
-        final px = raw.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
-        final py = raw.latitude * math.pi / 180.0 * earthRadius;
+      final abx = bx - ax;
+      final aby = by - ay;
+      final apx = px - ax;
+      final apy = py - ay;
+      final abLen2 = (abx * abx) + (aby * aby);
+      if (abLen2 == 0) continue;
 
-        final abx = bx - ax;
-        final aby = by - ay;
-        final apx = px - ax;
-        final apy = py - ay;
-        final abLen2 = (abx * abx) + (aby * aby);
-        if (abLen2 == 0) continue;
+      var t = (apx * abx + apy * aby) / abLen2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
 
-        var t = (apx * abx + apy * aby) / abLen2;
-        if (t < 0) t = 0;
-        if (t > 1) t = 1;
+      final projx = ax + abx * t;
+      final projy = ay + aby * t;
 
-        final projx = ax + abx * t;
-        final projy = ay + aby * t;
+      final dx = px - projx;
+      final dy = py - projy;
+      final dist = math.sqrt(dx * dx + dy * dy);
 
-        final dx = px - projx;
-        final dy = py - projy;
-        final dist = math.sqrt(dx * dx + dy * dy);
-
-        if (dist < minDist) {
-          minDist = dist;
-          final snapLat = (projy / earthRadius) * 180.0 / math.pi;
-          final snapLng =
-              (projx / (earthRadius * math.cos(refLat))) * 180.0 / math.pi;
-          bestPoint = LatLng(snapLat, snapLng);
-          bestHeading = _bearingBetween(a, b);
-          bestIndex = i;
-        }
+      if (dist < minDist) {
+        minDist = dist;
+        final snapLat = (projy / earthRadius) * 180.0 / math.pi;
+        final snapLng =
+            (projx / (earthRadius * math.cos(refLat))) * 180.0 / math.pi;
+        bestPoint = LatLng(snapLat, snapLng);
+        bestHeading = _bearingBetween(a, b);
       }
     }
 
-    // Pass 1: ventana local
-    evalRange(start, end, 1);
-
-    // Pass 2: si está muy lejos de la ruta (o la ventana no alcanzó), hacemos una pasada "coarse" por toda la polyline.
-    if (bestPoint == null || minDist > 60.0) {
-      int step = (n / 140).ceil();
-      if (step < 1) step = 1;
-      if (step > 20) step = 20;
-      evalRange(0, n - 2, step);
-    }
-
-    // Si estamos muy lejos de la ruta, no "pegamos" el auto a la línea (evita saltos raros).
-    if (minDist > 35.0) return null;
-
     if (bestPoint == null) return null;
-    _lastSnapSegIndex = bestIndex;
-    return _SnapResult(position: bestPoint!, heading: _wrap360(bestHeading));
+    return _SnapResult(position: bestPoint, heading: _wrap360(bestHeading));
   }
 
   double _shortestAngleDelta(double from, double to) {
@@ -3406,11 +3317,9 @@ class _MapsState extends State<Maps>
                                                     if (mounted) {
                                                       setState(() {
                                                         _followDriver = false;
-                                                        _userGestureHoldUntil = DateTime.now().add(const Duration(seconds: 4));
                                                       });
                                                     } else {
                                                       _followDriver = false;
-                                                      _userGestureHoldUntil = DateTime.now().add(const Duration(seconds: 4));
                                                     }
                                                   },
                                                   onCameraIdle: () {
@@ -11244,4 +11153,3 @@ class _EcgPulsePainter extends CustomPainter {
     return oldDelegate.progress != progress || oldDelegate.intensity != intensity;
   }
 }
-
