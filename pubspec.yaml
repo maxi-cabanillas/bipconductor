@@ -118,6 +118,7 @@ flutter:
     - assets/map_default.json
     - assets/images/flag_pickup.png
     - assets/images/flag_dropoff.png
+    - assets/icons/driver_f1_256.png
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
 
