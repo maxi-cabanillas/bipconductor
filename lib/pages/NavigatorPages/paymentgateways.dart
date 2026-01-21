@@ -8,6 +8,7 @@ import 'package:flutter_driver/styles/styles.dart';
 import 'package:flutter_driver/translation/translation.dart';
 import 'package:flutter_driver/widgets/widgets.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 // ignore: must_be_immutable
 class PaymentGateWaysPage extends StatefulWidget {
@@ -26,54 +27,82 @@ class _PaymentGateWaysPageState extends State<PaymentGateWaysPage> {
 
   @override
   void initState() {
-    // #docregion platform_features
-    dynamic paymentUrl;
+    // Construimos una URL válida (con scheme) para cargar en WebView.
+    // En algunos backends, widget.url llega como "mercadopago" (sin https),
+    // entonces hay que prefijar con el dominio base global `url` (functions.dart).
+    final String raw = (widget.url ?? '').toString().trim();
 
-    paymentUrl =
-        '${widget.url}?amount=$addMoney&payment_for=wallet&currency=${walletBalance['currency_symbol']}&user_id=${userDetails['user_id'].toString()}';
+    // Base absoluta: si ya viene con http(s), la usamos; si no, la completamos con `url`.
+    final String absoluteBase = (raw.startsWith('http://') || raw.startsWith('https://'))
+        ? raw
+        : '${url}${raw.startsWith('/') ? raw.substring(1) : raw}';
+
+    final Uri baseUri = Uri.parse(absoluteBase);
+
+    // Armamos params del checkout (wallet).
+    final Map<String, String> qp = <String, String>{}
+      ..addAll(baseUri.queryParameters)
+      ..addAll(<String, String>{
+        'amount': addMoney.toString(),
+        'payment_for': 'wallet',
+        'currency': (walletBalance['currency_symbol'] ?? '').toString(),
+        'user_id': (userDetails['user_id'] ?? '').toString(),
+      });
+
+    final Uri paymentUri = baseUri.replace(queryParameters: qp);
 
     late final PlatformWebViewControllerCreationParams params;
-
     params = const PlatformWebViewControllerCreationParams();
 
     final WebViewController controller =
-        WebViewController.fromPlatformCreationParams(params);
-    // #enddocregion platform_features
+    WebViewController.fromPlatformCreationParams(params);
 
     controller
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(const Color(0x00000000))
       ..setNavigationDelegate(
         NavigationDelegate(
-          onWebResourceError: (WebResourceError error) {
-            debugPrint('''
-Page resource error:
-  code: ${error.errorCode}
-  description: ${error.description}
-  errorType: ${error.errorType}
-  isForMainFrame: ${error.isForMainFrame}
-          ''');
-          },
-          onNavigationRequest: (NavigationRequest request) {
-            if (request.url.startsWith('${widget.url}/payment/success')) {
-              setState(() {
-                pop = true;
-                _success = true;
-              });
-            } else if (request.url.startsWith('${url}failure')) {
+          onNavigationRequest: (NavigationRequest request) async {
+            final String u = request.url;
+            // Debug: para ver por dónde navega Mercado Pago
+            // ignore: avoid_print
+            print('PAY NAV => $u');
+
+            // Interceptar esquemas especiales (intent://, mercadopago://, market://, etc.)
+            // WebView no puede manejarlos bien; se abren afuera.
+            if (!(u.startsWith('http://') || u.startsWith('https://'))) {
+              final Uri? ext = Uri.tryParse(u);
+              if (ext != null && await canLaunchUrl(ext)) {
+                await launchUrl(ext, mode: LaunchMode.externalApplication);
+              }
+              return NavigationDecision.prevent;
+            }
+
+            // Success / Failure (back_urls del backend suelen volver a tu dominio base `url`)
+            if (u.startsWith('${url}success')) {
               setState(() {
                 pop = false;
+                _success = true;
               });
-            } else if (request.url.startsWith('${url}failure')) {
+              return NavigationDecision.prevent;
+            }
+
+            if (u.startsWith('${url}failure')) {
+              // No mostramos overlay de éxito; habilitamos el back.
               setState(() {
                 pop = true;
               });
+              return NavigationDecision.navigate;
             }
+
             return NavigationDecision.navigate;
+          },
+          onWebResourceError: (e) {
+            // ignore: avoid_print
+            print('PAY WEB ERROR => $e');
           },
         ),
       )
-      ..loadRequest(Uri.parse(paymentUrl));
+      ..loadRequest(paymentUri);
 
     _controller = controller;
     super.initState();
@@ -115,62 +144,62 @@ Page resource error:
             //payment success
             (_success == true)
                 ? Positioned(
-                    top: 0,
-                    child: Container(
-                      alignment: Alignment.center,
-                      height: media.height * 1,
-                      width: media.width * 1,
-                      color: Colors.transparent.withOpacity(0.6),
-                      child: Container(
-                        padding: EdgeInsets.all(media.width * 0.05),
-                        width: media.width * 0.9,
-                        height: media.width * 0.8,
-                        decoration: BoxDecoration(
-                            color: page,
-                            borderRadius:
-                                BorderRadius.circular(media.width * 0.03)),
-                        child: Column(
-                          children: [
-                            Image.asset(
-                              'assets/images/paymentsuccess.png',
-                              fit: BoxFit.contain,
-                              width: media.width * 0.5,
-                            ),
-                            MyText(
-                              text: languages[choosenLanguage]
-                                  ['text_paymentsuccess'],
-                              textAlign: TextAlign.center,
-                              size: media.width * sixteen,
-                              fontweight: FontWeight.w600,
-                            ),
-                            SizedBox(
-                              height: media.width * 0.07,
-                            ),
-                            Button(
-                                onTap: () {
-                                  setState(() {
-                                    _success = false;
-                                    Navigator.pop(context, true);
-                                  });
-                                },
-                                text: languages[choosenLanguage]['text_ok'])
-                          ],
+                top: 0,
+                child: Container(
+                  alignment: Alignment.center,
+                  height: media.height * 1,
+                  width: media.width * 1,
+                  color: Colors.transparent.withOpacity(0.6),
+                  child: Container(
+                    padding: EdgeInsets.all(media.width * 0.05),
+                    width: media.width * 0.9,
+                    height: media.width * 0.8,
+                    decoration: BoxDecoration(
+                        color: page,
+                        borderRadius:
+                        BorderRadius.circular(media.width * 0.03)),
+                    child: Column(
+                      children: [
+                        Image.asset(
+                          'assets/images/paymentsuccess.png',
+                          fit: BoxFit.contain,
+                          width: media.width * 0.5,
                         ),
-                      ),
-                    ))
+                        MyText(
+                          text: languages[choosenLanguage]
+                          ['text_paymentsuccess'],
+                          textAlign: TextAlign.center,
+                          size: media.width * sixteen,
+                          fontweight: FontWeight.w600,
+                        ),
+                        SizedBox(
+                          height: media.width * 0.07,
+                        ),
+                        Button(
+                            onTap: () {
+                              setState(() {
+                                _success = false;
+                                Navigator.pop(context, true);
+                              });
+                            },
+                            text: languages[choosenLanguage]['text_ok'])
+                      ],
+                    ),
+                  ),
+                ))
                 : Container(),
 
             //no internet
             (internet == false)
                 ? Positioned(
-                    top: 0,
-                    child: NoInternet(
-                      onTap: () {
-                        setState(() {
-                          internetTrue();
-                        });
-                      },
-                    ))
+                top: 0,
+                child: NoInternet(
+                  onTap: () {
+                    setState(() {
+                      internetTrue();
+                    });
+                  },
+                ))
                 : Container(),
           ],
         ),

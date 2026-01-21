@@ -3,6 +3,7 @@
 import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' as ui;
+import 'dart:typed_data';
 // import 'package:dash_bubble/dash_bubble.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
@@ -94,6 +95,9 @@ class _MapsState extends State<Maps>
   bool _pickAnimateDone = false;
   dynamic addressBottom;
   dynamic _addressBottom;
+
+  // Auto-open the on-ride bottom sheet once per trip so the driver can see Origen/Destino/Precio sin arrastrar.
+  bool _bippAutoOpenOnRidePanel = false;
   bool fmPolyGot = false;
   late geolocator.LocationPermission permission;
   Location location = Location();
@@ -108,6 +112,105 @@ class _MapsState extends State<Maps>
 
   // Uber/Didi style: rotate camera to driver heading and keep the car icon pointing "forward" (up) on screen.
   bool _followBearing = true; // false when user moves the map manually
+  // Auto re-follow (tipo Google Maps): si el usuario panea, se apaga el follow; a los 10s vuelve solo.
+  Timer? _bippAutoFollowTimer;
+  static const Duration _bippAutoFollowDelay = Duration(seconds: 10);
+  static const double _bippPanDisableMeters = 65.0;
+
+  LatLng? _bippDriverLatLngNow() {
+    try {
+      if (_uiDisplayLatLng != null) return _uiDisplayLatLng;
+      if (_lastFixLatLng != null) return _lastFixLatLng;
+      if (center != null && center is LatLng) return center as LatLng;
+      if (currentLocation.latitude != 0.0 || currentLocation.longitude != 0.0) return currentLocation;
+    } catch (_) {}
+    return null;
+  }
+
+  void _bippCancelAutoFollow() {
+    _bippAutoFollowTimer?.cancel();
+    _bippAutoFollowTimer = null;
+  }
+
+  void _bippScheduleAutoFollow() {
+    _bippCancelAutoFollow();
+    _bippAutoFollowTimer = Timer(_bippAutoFollowDelay, () {
+      if (!mounted) return;
+      _bippResumeFollowNow();
+    });
+  }
+
+  void _bippResumeFollowNow() {
+    _bippCancelAutoFollow();
+    final p = _bippDriverLatLngNow();
+    if (p == null) return;
+
+    if (mounted) {
+      setState(() {
+        _followDriver = true;
+        _followBearing = true;
+      });
+    } else {
+      _followDriver = true;
+      _followBearing = true;
+    }
+
+    final desiredBearing = _wrap360(_headingDeg);
+    _markProgrammaticCameraMove(const Duration(milliseconds: 900));
+    _controller?.moveCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(target: p, zoom: _currentZoom, bearing: desiredBearing),
+      ),
+    );
+  }
+
+  void _bippOnUserCameraMoveStarted() {
+    if (_isProgrammaticCameraMove()) return;
+    _bippCancelAutoFollow();
+  }
+
+  void _bippOnUserCameraMove(CameraPosition pos) {
+    _currentZoom = pos.zoom;
+    if (_isProgrammaticCameraMove()) return;
+
+    final driver = _bippDriverLatLngNow();
+    if (driver == null) return;
+
+    final dist = geolocator.Geolocator.distanceBetween(
+      driver.latitude,
+      driver.longitude,
+      pos.target.latitude,
+      pos.target.longitude,
+    );
+
+    // Pinch/zoom mantiene el target cerca del driver. Pan se va lejos => desactivamos follow.
+    if (_followDriver && dist > _bippPanDisableMeters) {
+      if (mounted) {
+        setState(() {
+          _followDriver = false;
+          _followBearing = false;
+        });
+      } else {
+        _followDriver = false;
+        _followBearing = false;
+      }
+      _bippScheduleAutoFollow();
+      return;
+    }
+
+    // Si ya estás en manual, reprogramá el auto-follow para 10s después del último toque.
+    if (!_followDriver) {
+      _bippScheduleAutoFollow();
+    }
+  }
+
+  void _bippOnUserCameraIdle() {
+    if (_isProgrammaticCameraMove()) return;
+    if (!_followDriver) {
+      _bippScheduleAutoFollow();
+    }
+  }
+
 
   // Used to ignore onCameraMoveStarted events triggered by our own animate/move camera calls.
   DateTime? _programmaticCameraMoveUntil;
@@ -145,6 +248,12 @@ class _MapsState extends State<Maps>
   DateTime? _lastDebugAt;
   int _offRouteConsecutive = 0;
 
+  // Polyline repaint throttle (avoid heavy redraws causing skipped frames)
+  DateTime? _lastPolylinePaintAt;
+  int _lastPolylinePaintSig = 0;
+  Timer? _polylinePaintTimer;
+  static const Duration _polylinePaintMinInterval = Duration(milliseconds: 650);
+
   static const Duration _uiFrameInterval = Duration(milliseconds: 100);
   static const Duration _uiSmoothingWindow = Duration(milliseconds: 1200);
   static const Duration _uiNotifyInterval = Duration(milliseconds: 300);
@@ -162,6 +271,14 @@ class _MapsState extends State<Maps>
   // BIP: cache/refresh de stats de hoy (viajes + ganancia) para el panel superior
   int _bippLastTodayStatsFetchMs = 0;
   bool _bippTodayStatsFetchInFlight = false;
+
+  // BIP: Zonas no seguras (Google My Maps KML)
+  static const String _bippUnsafeZonesKmlUrl =
+      'https://www.google.com/maps/d/u/0/kml?mid=1cHf6_AvF2KQ7n64qGrruVmXY7T9-nlQ&forcekml=1';
+  bool _showUnsafeZones = true;
+  bool _unsafeZonesLoadedOnce = false;
+  bool _unsafeZonesLoadOk = false;
+  Set<Polygon> _unsafeZonePolygons = <Polygon>{};
 
 
   dynamic animationController;
@@ -424,32 +541,110 @@ class _MapsState extends State<Maps>
   }
 
 
+  Future<Uint8List> _drawBlueNavArrowPng({required int sizePx}) async {
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final size = Size(sizePx.toDouble(), sizePx.toDouble());
+
+    // Fondo transparente
+    final clearPaint = Paint()..blendMode = BlendMode.clear;
+    canvas.drawRect(Offset.zero & size, clearPaint);
+
+    final w = size.width;
+    final h = size.height;
+
+    // Flecha tipo Google/Waze: punta arriba + base con "mordida"
+    final tip = Offset(w * 0.50, h * 0.10);
+    final right = Offset(w * 0.84, h * 0.88);
+    final notch = Offset(w * 0.50, h * 0.62);
+    final left = Offset(w * 0.16, h * 0.88);
+
+    final path = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(right.dx, right.dy)
+      ..lineTo(notch.dx, notch.dy)
+      ..lineTo(left.dx, left.dy)
+      ..close();
+
+    // Sombra suave
+    canvas.drawShadow(path, Colors.black.withOpacity(0.45), w * 0.06, true);
+
+    // Borde blanco "premium"
+    final stroke = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = w * 0.075
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round
+      ..color = Colors.white.withOpacity(0.95);
+    canvas.drawPath(path, stroke);
+
+    // Relleno con degradé (azul Google)
+    final fill = Paint()
+      ..style = PaintingStyle.fill
+      ..shader = ui.Gradient.linear(
+        Offset(w * 0.22, h * 0.18),
+        Offset(w * 0.82, h * 0.90),
+        const [
+          Color(0xFF64B5F6),
+          Color(0xFF1E88E5),
+          Color(0xFF0D47A1),
+        ],
+        const [0.0, 0.55, 1.0],
+      );
+    canvas.drawPath(path, fill);
+
+    // Faceta izquierda (más oscura) para efecto 3D
+    final leftFacet = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(notch.dx, notch.dy)
+      ..lineTo(left.dx, left.dy)
+      ..close();
+    final leftPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = const Color(0xFF082E6E).withOpacity(0.30);
+    canvas.drawPath(leftFacet, leftPaint);
+
+    // Faceta derecha (highlight)
+    final rightFacet = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(right.dx, right.dy)
+      ..lineTo(notch.dx, notch.dy)
+      ..close();
+    final rightPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.white.withOpacity(0.10);
+    canvas.drawPath(rightFacet, rightPaint);
+
+    // Destello superior
+    final glint = Path()
+      ..moveTo(w * 0.50, h * 0.18)
+      ..lineTo(w * 0.64, h * 0.44)
+      ..lineTo(w * 0.50, h * 0.40)
+      ..lineTo(w * 0.36, h * 0.44)
+      ..close();
+    final glintPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.white.withOpacity(0.22);
+    canvas.drawPath(glint, glintPaint);
+
+    final picture = recorder.endRecording();
+    final img = await picture.toImage(sizePx, sizePx);
+    final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+    return bytes!.buffer.asUint8List();
+  }
+
 
   Future<void> _ensureDriverGoogleArrowIcon() async {
-    // En esta app, este BitmapDescriptor se usa como "icono del conductor" en Google Maps.
-    // Antes estaba dibujando una flecha con Canvas; ahora cargamos el auto F1 desde assets.
+    // Icono del conductor (Google Maps): flecha azul tipo Google/Waze (sin F1).
     if (_driverGoogleArrowIcon != null) return;
 
-    const String assetPath = 'assets/icons/driver_f1_256.png';
-    const int targetPx = 92; // <-- tamaño final del autito (subí a 190 si lo querés más grande)
+    const int targetPx = 180; // MÁS grande (antes estaba chico)
 
     try {
-      final byteData = await rootBundle.load(assetPath);
-      final codec = await ui.instantiateImageCodec(
-        byteData.buffer.asUint8List(),
-        targetWidth: targetPx,
-        targetHeight: targetPx,
-      );
-      final frame = await codec.getNextFrame();
-      final pngBytes =
-      await frame.image.toByteData(format: ui.ImageByteFormat.png);
-      if (pngBytes == null) return;
-
-      _driverGoogleArrowIcon = BitmapDescriptor.fromBytes(
-        pngBytes.buffer.asUint8List(),
-      );
+      final png = await _drawBlueNavArrowPng(sizePx: targetPx);
+      _driverGoogleArrowIcon = BitmapDescriptor.fromBytes(png);
     } catch (_) {
-      // Si el asset no existe o falla la carga, dejamos null para que el marker use el icono por defecto (pinLocationIcon*).
+      // fallback: null => usa pinLocationIcon*
     }
   }
 
@@ -492,6 +687,197 @@ class _MapsState extends State<Maps>
     }
   }
 
+  // BIP: helpers para zonas no seguras
+
+  Future<void> _loadUnsafeZonesFromKml() async {
+    _unsafeZonesLoadedOnce = true;
+    try {
+      final res = await http.get(Uri.parse(_bippUnsafeZonesKmlUrl));
+      if (res.statusCode != 200) {
+        _unsafeZonesLoadOk = false;
+        return;
+      }
+      final polys = _parseKmlPolygons(res.body);
+      if (!mounted) return;
+      setState(() {
+        _unsafeZonePolygons = polys;
+        _unsafeZonesLoadOk = polys.isNotEmpty;
+      });
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Set<Polygon> _parseKmlPolygons(String kml) {
+    final Set<Polygon> out = <Polygon>{};
+    try {
+      final coordRe = RegExp(r'<coordinates>([\s\S]*?)</coordinates>', caseSensitive: false);
+      int idx = 0;
+      for (final m in coordRe.allMatches(kml)) {
+        final raw = (m.group(1) ?? '').trim();
+        final pts = _parseKmlCoordinateString(raw);
+        if (pts.length < 3) continue;
+        idx += 1;
+        out.add(
+          Polygon(
+            polygonId: PolygonId('unsafe_$idx'),
+            points: pts,
+            strokeWidth: 2,
+            strokeColor: Colors.red,
+            fillColor: Colors.red.withOpacity(0.20),
+            geodesic: true,
+          ),
+        );
+      }
+    } catch (_) {
+      // ignore
+    }
+    return out;
+  }
+
+  List<LatLng> _parseKmlCoordinateString(String raw) {
+    final pts = <LatLng>[];
+    // KML: lon,lat[,alt] separados por espacios/nuevas líneas
+    for (final part in raw.split(RegExp(r'\s+'))) {
+      final t = part.trim();
+      if (t.isEmpty) continue;
+      final seg = t.split(',');
+      if (seg.length < 2) continue;
+      final lon = double.tryParse(seg[0]);
+      final lat = double.tryParse(seg[1]);
+      if (lat == null || lon == null) continue;
+      pts.add(LatLng(lat, lon));
+    }
+    // Algunos KML repiten el primer punto al final: lo removemos para evitar doble punto
+    if (pts.length >= 2) {
+      final a = pts.first;
+      final b = pts.last;
+      if ((a.latitude - b.latitude).abs() < 1e-10 && (a.longitude - b.longitude).abs() < 1e-10) {
+        pts.removeLast();
+      }
+    }
+    return pts;
+  }
+
+  bool _pointInPolygon(LatLng p, List<LatLng> poly) {
+    // Ray casting
+    final x = p.longitude;
+    final y = p.latitude;
+    bool inside = false;
+    for (int i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      final xi = poly[i].longitude;
+      final yi = poly[i].latitude;
+      final xj = poly[j].longitude;
+      final yj = poly[j].latitude;
+
+      final intersect = ((yi > y) != (yj > y)) &&
+          (x < (xj - xi) * (y - yi) / ((yj - yi) == 0 ? 1e-12 : (yj - yi)) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  bool _isUnsafeLatLng(LatLng p) {
+    for (final poly in _unsafeZonePolygons) {
+      final pts = poly.points;
+      if (pts.length < 3) continue;
+      if (_pointInPolygon(p, pts)) return true;
+    }
+    return false;
+  }
+
+  bool? _safetyResultFor(LatLng? p) {
+    if (p == null) return null;
+    if (!_unsafeZonesLoadedOnce) return null;
+    if (!_unsafeZonesLoadOk) return null;
+    return _isUnsafeLatLng(p);
+  }
+
+  Widget _bippSafetyPill({
+    required String label,
+    required bool? unsafe,
+    required double fontSize,
+  }) {
+    final isUnknown = unsafe == null;
+    final isUnsafe = unsafe == true;
+
+    final text = isUnknown
+        ? '$label: ...'
+        : '$label: ${isUnsafe ? 'INSEGURO' : 'SEGURO'}';
+
+    final Color border = isUnknown
+        ? Colors.white.withOpacity(0.35)
+        : (isUnsafe ? Colors.red : Colors.green);
+
+    final Color bg = isUnknown
+        ? Colors.white.withOpacity(0.08)
+        : (isUnsafe ? Colors.red.withOpacity(0.15) : Colors.green.withOpacity(0.15));
+
+    final IconData icon = isUnknown
+        ? Icons.help_outline
+        : (isUnsafe ? Icons.warning_amber_rounded : Icons.verified_rounded);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: border, width: 1),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, size: fontSize + 2, color: border),
+          const SizedBox(width: 6),
+          Text(
+            text,
+            style: GoogleFonts.notoSans(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w800,
+              color: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+
+
+  /// BIP: calcula distancia/tiempo aproximados desde el cliente (origen) hasta el destino
+  /// usando coordenadas pick_* y drop_* del driverReq.
+  /// No usa Directions (0 costo extra de Google), es aproximación en línea recta.
+  Map<String, String>? _bippPickupToDropInfo() {
+    try {
+      if (driverReq.isEmpty) return null;
+
+      final dynamic rawRental = driverReq['is_rental'];
+      final bool isRental = rawRental == true || rawRental == 1 || rawRental?.toString() == '1';
+      if (isRental) return null;
+
+      final pickLat = _asDouble(driverReq['pick_lat']);
+      final pickLng = _asDouble(driverReq['pick_lng']);
+      final dropLat = _asDouble(driverReq['drop_lat']);
+      final dropLng = _asDouble(driverReq['drop_lng']);
+      if (pickLat == null || pickLng == null || dropLat == null || dropLng == null) return null;
+
+      final meters = geolocator.Geolocator.distanceBetween(pickLat, pickLng, dropLat, dropLng);
+      final km = meters / 1000.0;
+
+      // Estimación simple de minutos (promedio urbano ~30 km/h).
+      // mins = km / 30 * 60 = km * 2
+      final int mins = (km * 2.0).round().clamp(1, 9999);
+
+      return {
+        'km': km.toStringAsFixed(2),
+        'mins': mins.toString(),
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
   // final platforms = const MethodChannel('flutter.app/awake');
   @override
   void initState() {
@@ -513,6 +899,8 @@ class _MapsState extends State<Maps>
     getLocs();
     _startLiveDriverTracking();
     getonlineoffline();
+    _loadUnsafeZonesFromKml();
+
 
 
     // Animación estética para el texto "BUSCANDO VIAJE"
@@ -649,7 +1037,7 @@ class _MapsState extends State<Maps>
       _livePosSub = positionStreamUpdates.listen((pos) async {
         final now = DateTime.now();
         if (_lastLivePosHandledAt != null &&
-            now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
+            now.difference(_lastLivePosHandledAt!).inMilliseconds < 220) {
           return;
         }
         _lastLivePosHandledAt = now;
@@ -865,20 +1253,160 @@ class _MapsState extends State<Maps>
   // ============================
   // Waze-like route styling (Google Maps)
   // ============================
+
+  /// Target point for the current navigation phase.
+  /// - Before trip start: pickup
+  /// - After trip start: drop
+  LatLng? _routePhaseTarget() {
+    try {
+      if (driverReq.isEmpty) return null;
+      if (driverReq['accepted_at'] == null) return null;
+
+      final bool tripStarted = _tripStartValue() == 1;
+      final lat = _asDouble(tripStarted ? driverReq['drop_lat'] : driverReq['pick_lat']);
+      final lng = _asDouble(tripStarted ? driverReq['drop_lng'] : driverReq['pick_lng']);
+      if (lat == null || lng == null) return null;
+      return LatLng(lat, lng);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  double _routeMeters(List<LatLng> pts) {
+    if (pts.length < 2) return 0.0;
+    double sum = 0.0;
+    for (int i = 1; i < pts.length; i++) {
+      final a = pts[i - 1];
+      final b = pts[i];
+      sum += geolocator.Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+    }
+    return sum;
+  }
+
+  double _median(List<double> xs) {
+    if (xs.isEmpty) return 0.0;
+    xs.sort();
+    final mid = xs.length ~/ 2;
+    if (xs.length.isOdd) return xs[mid];
+    return (xs[mid - 1] + xs[mid]) / 2.0;
+  }
+
+  /// Removes the classic "go + return straight" artifact when the points list
+  /// contains two disjoint segments (Google draws a straight line between them).
+  /// We split by big jumps and keep the best segment (usually the real route).
+  List<LatLng> _cleanRoutePoints(List<LatLng> input) {
+    if (input.length < 2) return input;
+
+    // 1) Remove consecutive duplicates / jitter.
+    final List<LatLng> pts = <LatLng>[];
+    pts.add(input.first);
+    for (int i = 1; i < input.length; i++) {
+      final prev = pts.last;
+      final cur = input[i];
+      final d = geolocator.Geolocator.distanceBetween(
+        prev.latitude,
+        prev.longitude,
+        cur.latitude,
+        cur.longitude,
+      );
+      if (d >= 0.8) {
+        pts.add(cur);
+      }
+    }
+    if (pts.length < 2) return pts;
+
+    // 2) Estimate a jump threshold from typical segment distances.
+    final List<double> steps = <double>[];
+    for (int i = 1; i < pts.length; i++) {
+      final a = pts[i - 1];
+      final b = pts[i];
+      final d = geolocator.Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+      // Normal polyline steps are usually small; ignore huge steps for median.
+      if (d > 0.1 && d < 200) steps.add(d);
+    }
+    final med = steps.isNotEmpty ? _median(steps) : 18.0;
+    final jumpThresh = (med * 12.0).clamp(250.0, 2500.0);
+
+    // 3) Split into segments on large jumps.
+    final List<List<LatLng>> segments = <List<LatLng>>[];
+    List<LatLng> curSeg = <LatLng>[pts.first];
+    for (int i = 1; i < pts.length; i++) {
+      final a = pts[i - 1];
+      final b = pts[i];
+      final d = geolocator.Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+      if (d > jumpThresh) {
+        if (curSeg.length >= 2) segments.add(curSeg);
+        curSeg = <LatLng>[b];
+      } else {
+        curSeg.add(b);
+      }
+    }
+    if (curSeg.length >= 2) segments.add(curSeg);
+    if (segments.isEmpty) return pts;
+    if (segments.length == 1) return segments.first;
+
+    // 4) Pick the best segment.
+    final target = _routePhaseTarget();
+    double bestScore = -1e18;
+    List<LatLng> best = segments.first;
+    for (final seg in segments) {
+      final len = _routeMeters(seg);
+      double score = len;
+      if (target != null) {
+        final end = seg.last;
+        final endDist = geolocator.Geolocator.distanceBetween(
+          end.latitude,
+          end.longitude,
+          target.latitude,
+          target.longitude,
+        );
+        // Strongly prefer segments that actually end near the target.
+        if (endDist < 250) {
+          score += 20000;
+        }
+        score -= endDist * 3.0;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = seg;
+      }
+    }
+    return best;
+  }
   void _applyWazePolylineStyle() {
     try {
       if (mapType != 'google') return;
       if (polyList.isEmpty) return;
 
-      // Replace the route polyline with a thick "double stroke" (border + main line)
-      polyline.clear();
+      final cleanedPoints = _cleanRoutePoints(polyList);
+      if (cleanedPoints.length < 2) return;
+      // Replace ONLY the route polyline (do not clear the whole set -> avoids flicker and "double line").
+      polyline.removeWhere((p) =>
+      p.polylineId.value == 'route' ||
+          p.polylineId.value == 'route_main' ||
+          p.polylineId.value == 'route_border');
 
       polyline.add(
         Polyline(
-          polylineId: const PolylineId('route_border'),
-          points: polyList,
-          color: const Color(0xFF6A1B9A).withOpacity(0.25),
-          width: 14,
+          polylineId: const PolylineId('route'),
+          points: cleanedPoints,
+          color: const Color(0xFF1E88E5),
+          width: 7,
           startCap: Cap.roundCap,
           endCap: Cap.roundCap,
           jointType: JointType.round,
@@ -886,22 +1414,67 @@ class _MapsState extends State<Maps>
           zIndex: 0,
         ),
       );
-
-      polyline.add(
-        Polyline(
-          polylineId: const PolylineId('route_main'),
-          points: polyList,
-          color: const Color(0xFF6A1B9A),
-          width: 9,
-          startCap: Cap.roundCap,
-          endCap: Cap.roundCap,
-          jointType: JointType.round,
-          geodesic: true,
-          zIndex: 1,
-        ),
-      );
     } catch (_) {}
   }
+
+  int _polylineSignature(List<LatLng> pts) {
+    if (pts.length < 2) return pts.length;
+    int h = pts.length;
+    // Quantize to avoid tiny float noise changing the hash too often.
+    int q(double x) => (x * 1e5).round();
+    final a = pts.first;
+    final b = pts.last;
+    h = 31 * h + q(a.latitude);
+    h = 31 * h + q(a.longitude);
+    h = 31 * h + q(b.latitude);
+    h = 31 * h + q(b.longitude);
+    if (pts.length > 6) {
+      final m = pts[pts.length ~/ 2];
+      h = 31 * h + q(m.latitude);
+      h = 31 * h + q(m.longitude);
+    }
+    return h & 0x7fffffff;
+  }
+
+  /// Throttled repaint for Google route polyline (prevents UI jank).
+  void _applyWazePolylineStyleThrottled({bool force = false}) {
+    try {
+      if (mapType != 'google') return;
+      if (polyList.length < 2) return;
+
+      final now = DateTime.now();
+      final sig = _polylineSignature(polyList);
+      final lastAt = _lastPolylinePaintAt;
+      final elapsedMs = (lastAt == null) ? 1e9 : now.difference(lastAt).inMilliseconds.toDouble();
+
+      // If nothing meaningful changed recently, skip.
+      if (!force && sig == _lastPolylinePaintSig && elapsedMs < 1500) {
+        return;
+      }
+
+      // Enforce a minimum interval between repaint operations.
+      if (!force && lastAt != null) {
+        final minMs = _polylinePaintMinInterval.inMilliseconds;
+        if (elapsedMs < minMs) {
+          _polylinePaintTimer?.cancel();
+          final delay = Duration(milliseconds: (minMs - elapsedMs).ceil());
+          _polylinePaintTimer = Timer(delay, () {
+            if (!mounted) return;
+            _applyWazePolylineStyleThrottled(force: true);
+          });
+          return;
+        }
+      }
+
+      _polylinePaintTimer?.cancel();
+      _lastPolylinePaintAt = now;
+      _lastPolylinePaintSig = sig;
+
+      _applyWazePolylineStyle();
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
 
   int _tripStartValue() {
     if (driverReq.isEmpty) return 0;
@@ -1035,7 +1608,7 @@ class _MapsState extends State<Maps>
     _lastRouteRebuildAt = now;
     try {
       await rebuildRoutePolylinesFromCurrent();
-      syncGooglePolylineFromPolyList();
+      _applyWazePolylineStyleThrottled(force: true);
     } catch (_) {
       // If rebuild fails, keep the current polyline.
     } finally {
@@ -1063,9 +1636,10 @@ class _MapsState extends State<Maps>
         markerId: const MarkerId('1'),
         position: latLng,
         icon: (mapType == 'google' &&
-            userDetails['role'] == 'driver' &&
-            _driverGoogleArrowIcon != null)
+            userDetails['role'] == 'driver')
+            ? ((_followDriver && _driverGoogleArrowIcon != null)
             ? _driverGoogleArrowIcon!
+            : BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure))
             : icon,
         rotation: _vehicleRotationDeg(newHeading),
         flat: true,
@@ -1086,7 +1660,7 @@ class _MapsState extends State<Maps>
 
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 450) {
+        now.difference(_lastCameraMove!).inMilliseconds < 140) {
       return; // throttle camera work
     }
     if (_lastCameraTarget != null) {
@@ -1111,13 +1685,13 @@ class _MapsState extends State<Maps>
     bool useMoveCamera = false;
 
     if (_followBearing) {
-      _camBearingDeg = _smoothAngle(_camBearingDeg, desiredBearing, 0.20);
+      _camBearingDeg = _smoothAngle(_camBearingDeg, desiredBearing, 0.55);
       final delta = _shortestAngleDelta(_cameraBearing, _camBearingDeg);
 
       if (delta.abs() < 2.0) {
         bearingToApply = _wrap360(_cameraBearing);
       } else if (delta.abs() <= 45.0) {
-        bearingToApply = _smoothAngle(_cameraBearing, _camBearingDeg, 0.22);
+        bearingToApply = _smoothAngle(_cameraBearing, _camBearingDeg, 0.60);
       } else {
         bearingToApply = _camBearingDeg;
         useMoveCamera = true;
@@ -1134,7 +1708,7 @@ class _MapsState extends State<Maps>
     );
 
     if (mapType == 'google') {
-      if (useMoveCamera) {
+      if (useMoveCamera || (_lastFixSpeed > 0.7)) {
         _markProgrammaticCameraMove();
 
         _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
@@ -1285,6 +1859,7 @@ class _MapsState extends State<Maps>
   void dispose() {
     _setKeepScreenOn(false);
     _stopLiveDriverTracking();
+    _polylinePaintTimer?.cancel();
     if (_timer != null) {
       _timer.cancel();
     }
@@ -1586,7 +2161,7 @@ class _MapsState extends State<Maps>
     if (driverReq['drop_address'] != null || choosenRide.isNotEmpty) {
       // Rebuild route
       await Future.sync(() => getPolylines(false));
-      syncGooglePolylineFromPolyList();
+      _applyWazePolylineStyleThrottled(force: true);
 
       await addDropMarker();
     }
@@ -1877,28 +2452,25 @@ class _MapsState extends State<Maps>
 
     var media = MediaQuery.of(context).size;
 
-    // Bottom sheet (on-ride) sizing:
-    // - _panelCollapsed: cuánto se esconde cuando está "abajo"
-    // - _panelPeekHeight: cuánto queda visible cuando está "abajo" (bajalo para que se vea menos y el mapa se vea más)
-    final double _panelHeight = media.height * 1.2;
-    final double _panelPeekHeight = media.height * 0.10;
+    // Inset real de la barra de navegación del sistema (Samsung/Android).
+    // Usamos viewPadding para contemplar botones/gestos y evitar que el UI quede debajo.
+    final window = WidgetsBinding.instance.window;
+    final double _sysBottom = window.viewPadding.bottom / window.devicePixelRatio;
+    final double _safeHeight = (media.height - _sysBottom).clamp(0.0, media.height);
+
+    // Bottom sheet (on-ride) sizing (medido sobre el alto útil, sin la barra de navegación):
+    final double _panelHeight = _safeHeight * 1.2;
+    final double _panelPeekHeight = _safeHeight * 0.10;
     final double _panelCollapsed = _panelHeight - _panelPeekHeight;
 
-    // Límite de apertura para que el panel NO tape toda la pantalla:
-    // - Con viaje iniciado abrimos más (como tu imagen 3A).
-    // - Esperando al cliente abrimos menos (como tu imagen 4A).
-    final bool _tripStarted = (driverReq.isNotEmpty &&
-        (driverReq['is_trip_start'] == 1 || driverReq['is_trip_start'] == true));
-
-    final double _panelMaxOpenVisible =
-    _tripStarted ? (media.height * 0.72) : (media.height * 0.42);
+    // Maxi pidió que TODOS los paneles (esperando/en camino/llegar al destino/finalizar)
+    // suban más de la mitad para ver Origen/Destino/Precio sin arrastrar.
+    final double _panelMaxOpenVisible = _safeHeight * 0.82;
 
     // "hidden" mínimo (más chico = más abierto) para que visible nunca supere _panelMaxOpenVisible.
-    final double _panelOpenHidden =
-    (_panelHeight - _panelMaxOpenVisible).clamp(0.0, _panelCollapsed);
+    final double _panelOpenHidden = (_panelHeight - _panelMaxOpenVisible).clamp(0.0, _panelCollapsed);
 
-    final double _panelHidden =
-    (addressBottom ?? _panelCollapsed).clamp(_panelOpenHidden, _panelCollapsed);
+    final double _panelHidden = (addressBottom ?? _panelCollapsed).clamp(_panelOpenHidden, _panelCollapsed);
     final double _panelVisible = _panelHeight - _panelHidden;
 
     return PopScope(
@@ -1921,6 +2493,9 @@ class _MapsState extends State<Maps>
 
               // If a trip/request gets rejected/cancelled, ensure we clear the route and re-center on the driver.
               if (driverReq.isEmpty) {
+                // Reset bottom-sheet auto-open for the next trip
+                _bippAutoOpenOnRidePanel = false;
+                addressBottom = null;
                 if (!_pendingCenterAfterClear) {
                   _pendingCenterAfterClear = true;
                   WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -1931,6 +2506,17 @@ class _MapsState extends State<Maps>
                 }
               } else {
                 _pendingCenterAfterClear = false;
+              }
+
+              // Auto-open the on-ride bottom sheet once when a ride is accepted so the driver can see all info.
+              if (driverReq.isNotEmpty && driverReq['accepted_at'] != null && !_bippAutoOpenOnRidePanel) {
+                _bippAutoOpenOnRidePanel = true;
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted) return;
+                  setState(() {
+                    addressBottom = _panelOpenHidden;
+                  });
+                });
               }
 
               if (_isDarkTheme != isDarkTheme && _controller != null) {
@@ -2048,58 +2634,11 @@ class _MapsState extends State<Maps>
 
                       vsync: this, //From the widget
                     );
-                    if (mapType == 'google') {
-                      List polys = [];
-                      dynamic nearestLat;
-                      dynamic pol;
-                      for (var e in polyList) {
-                        var dist = calculateDistance(center.latitude,
-                            center.longitude, e.latitude, e.longitude);
-                        if (pol == null) {
-                          polys.add(dist);
-                          pol = dist;
-                          nearestLat = e;
-                        } else {
-                          if (dist < pol) {
-                            polys.add(dist);
-                            pol = dist;
-                            nearestLat = e;
-                          }
-                        }
-                      }
-                      int currentNumber = polyList
-                          .indexWhere((element) => element == nearestLat);
-                      for (var i = 0; i < currentNumber; i++) {
-                        polyList.removeAt(0);
-                      }
-                      polyline.clear();
-                      fmpoly.clear();
-                      syncGooglePolylineFromPolyList();
-                    } else {
-                      List polys = [];
-                      dynamic nearestLat;
-                      dynamic pol;
-                      for (var e in fmpoly) {
-                        var dist = calculateDistance(center.latitude,
-                            center.longitude, e.latitude, e.longitude);
-                        if (pol == null) {
-                          polys.add(dist);
-                          pol = dist;
-                          nearestLat = e;
-                        } else {
-                          if (dist < pol) {
-                            polys.add(dist);
-                            pol = dist;
-                            nearestLat = e;
-                          }
-                        }
-                      }
-                      int currentNumber =
-                      fmpoly.indexWhere((element) => element == nearestLat);
-                      for (var i = 0; i < currentNumber; i++) {
-                        fmpoly.removeAt(0);
-                      }
-                    }
+                    // FIX POLYLINE (estabilidad + rendimiento):
+                    // Antes: se recortaba polyList (removeRange) + se hacía polyline.clear() en cada tick.
+                    // Eso hacía que la ruta titile, se vea doble, aparezcan líneas raras y se ponga pesado.
+                    // Ahora: NO se recorta la polyline acá, ni se limpian polylines.
+                    // El reroute se maneja por el detector de desvío (_handleRouteDeviationAndSnap).
                     animateCar(
                         myMarkers
                             .firstWhere((element) =>
@@ -3269,6 +3808,10 @@ class _MapsState extends State<Maps>
                                             media.height * 1,
                                             width:
                                             media.width * 1,
+                                            // Fondo para que el área bajo la barra del sistema no quede blanca
+                                            color: const Color(0xFF001D1D),
+                                            // Reservamos el alto de la barra de navegación Android (Samsung)
+                                            padding: EdgeInsets.only(bottom: _sysBottom),
                                             //google maps
                                             child: (mapType ==
                                                 'google')
@@ -3298,32 +3841,25 @@ class _MapsState extends State<Maps>
                                                   },
                                                   padding: EdgeInsets.only(
                                                     bottom: (driverReq['accepted_at'] != null)
-                                                        ? (_panelVisible + MediaQuery.of(context).padding.bottom + 8)
+                                                        ? (_panelVisible + _sysBottom + 8)
                                                         : (media.width * 1),
                                                     top: _bippTopPadding,
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
                                                   onCameraMoveStarted: () {
-                                                    // Ignore camera moves during initial map settle, and ignore moves we triggered ourselves.
                                                     final createdAt = _mapCreatedAt;
                                                     if (createdAt != null &&
                                                         DateTime.now().difference(createdAt).inMilliseconds < 1500) {
                                                       return;
                                                     }
-                                                    if (_isProgrammaticCameraMove()) return;
-
-                                                    // User is interacting with the map: stop auto-following the camera.
-                                                    if (mounted) {
-                                                      setState(() {
-                                                        _followDriver = false;
-                                                      });
-                                                    } else {
-                                                      _followDriver = false;
-                                                    }
+                                                    _bippOnUserCameraMoveStarted();
+                                                  },
+                                                  onCameraMove: (pos) {
+                                                    _bippOnUserCameraMove(pos);
                                                   },
                                                   onCameraIdle: () {
-                                                    // Keep follow off until the user taps the re-center button.
+                                                    _bippOnUserCameraIdle();
                                                   },
                                                   initialCameraPosition:
                                                   CameraPosition(
@@ -3339,6 +3875,7 @@ class _MapsState extends State<Maps>
                                                       myMarkers),
                                                   polylines:
                                                   polyline,
+                                                  polygons: _showUnsafeZones ? _unsafeZonePolygons : <Polygon>{},
                                                   minMaxZoomPreference:
                                                   const MinMaxZoomPreference(
                                                       0.0,
@@ -4139,7 +4676,7 @@ class _MapsState extends State<Maps>
 
                                           //request popup accept or reject
                                           Positioned(
-                                              bottom: driverReq.isEmpty ? media.width * 0.20 : 0,
+                                              bottom: (driverReq.isEmpty ? media.width * 0.20 : 0) + _sysBottom,
                                               child: Column(
                                                 crossAxisAlignment:
                                                 CrossAxisAlignment
@@ -4301,8 +4838,7 @@ class _MapsState extends State<Maps>
                                                           onTap: () async {
                                                             if (locationAllowed == true) {
                                                               if (mapType == 'google') {
-                                                                _followDriver = true;
-                                                                _controller?.animateCamera(CameraUpdate.newCameraPosition(CameraPosition(target: center, zoom: _currentZoom, bearing: heading)));
+                                                                _bippResumeFollowNow();
                                                               } else {
                                                                 _fmController.move(fmlt.LatLng(center.latitude, center.longitude), 14);
                                                               }
@@ -4450,7 +4986,43 @@ class _MapsState extends State<Maps>
                                                                       ],
                                                                     ),
                                                                     SizedBox(
-                                                                      height: media.width * 0.025,
+                                                                      height: media.width * 0.015,
+                                                                    ),
+                                                                    // BIP: Seguridad de origen/destino (Zonas no seguras)
+                                                                    Builder(builder: (context) {
+                                                                      final pickLat = _asDouble(choosenRide[0]['pick_lat']);
+                                                                      final pickLng = _asDouble(choosenRide[0]['pick_lng']);
+                                                                      final dropLat = _asDouble(choosenRide[choosenRide.length - 1]['drop_lat']);
+                                                                      final dropLng = _asDouble(choosenRide[choosenRide.length - 1]['drop_lng']);
+
+                                                                      final pick = (pickLat != null && pickLng != null) ? LatLng(pickLat, pickLng) : null;
+                                                                      final drop = (dropLat != null && dropLng != null) ? LatLng(dropLat, dropLng) : null;
+
+                                                                      final pickUnsafe = _safetyResultFor(pick);
+                                                                      final dropUnsafe = _safetyResultFor(drop);
+
+                                                                      return Row(
+                                                                        children: [
+                                                                          Expanded(
+                                                                            child: _bippSafetyPill(
+                                                                              label: 'Origen',
+                                                                              unsafe: pickUnsafe,
+                                                                              fontSize: media.width * 0.030,
+                                                                            ),
+                                                                          ),
+                                                                          const SizedBox(width: 10),
+                                                                          Expanded(
+                                                                            child: _bippSafetyPill(
+                                                                              label: 'Destino',
+                                                                              unsafe: dropUnsafe,
+                                                                              fontSize: media.width * 0.030,
+                                                                            ),
+                                                                          ),
+                                                                        ],
+                                                                      );
+                                                                    }),
+                                                                    SizedBox(
+                                                                      height: media.width * 0.020,
                                                                     ),
                                                                     (choosenRide[0]['is_luggage_available'] == true || choosenRide[0]['is_pet_available'] == true)
                                                                         ? Column(
@@ -4616,7 +5188,7 @@ class _MapsState extends State<Maps>
                                                                                   setState(() {
                                                                                     isAvailable = false;
                                                                                   });
-                                                                                  FirebaseDatabase.instance.ref().child('drivers/driver_${userDetails['id']}').update({'is_available': false});
+                                                                                  FirebaseDatabase.instance.ref().child('drivers/driver_${userDetails['id']}').update({'is_available': 0, 'updated_at': ServerValue.timestamp});
                                                                                   Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const RidePage()), (route) => false);
                                                                                   // Navigator.pop(context);
                                                                                 } catch (e) {
@@ -4709,7 +5281,7 @@ class _MapsState extends State<Maps>
                                                                   children: [
                                                                     Container(
                                                                       width: media.width * 0.9,
-                                                                      height: media.width * 0.3,
+                                                                      height: media.width * 0.34,
                                                                       padding: EdgeInsets.all(media.width * 0.02),
                                                                       // color: Colors.yellow,
                                                                       child: Row(
@@ -4759,6 +5331,24 @@ class _MapsState extends State<Maps>
                                                                                       ),
                                                                                     ],
                                                                                   ),
+                                                                                  SizedBox(height: media.width * 0.005),
+                                                                                  Builder(builder: (context) {
+                                                                                    final info = _bippPickupToDropInfo();
+                                                                                    if (info == null) return const SizedBox.shrink();
+                                                                                    return Padding(
+                                                                                      padding: EdgeInsets.only(top: media.width * 0.005),
+                                                                                      child: Text(
+                                                                                        "${info['km']} km | ${info['mins']} ${languages[choosenLanguage]['text_mins']}",
+                                                                                        maxLines: 1,
+                                                                                        overflow: TextOverflow.ellipsis,
+                                                                                        style: TextStyle(
+                                                                                          color: Colors.white.withOpacity(0.9),
+                                                                                          fontSize: media.width * twelve,
+                                                                                          fontWeight: ui.FontWeight.w600,
+                                                                                        ),
+                                                                                      ),
+                                                                                    );
+                                                                                  }),
                                                                                   (driverReq['drop_address'] == null && driverReq['is_rental'] == false)
                                                                                       ? Container()
                                                                                       : Container(
@@ -5004,6 +5594,42 @@ class _MapsState extends State<Maps>
                                                                         ),
                                                                       ),
                                                                     ),
+                                                                    // BIP: Seguridad de origen/destino (Zonas no seguras) - driverReq
+                                                                    Builder(builder: (context) {
+                                                                      final pickLat = _asDouble(driverReq['pick_lat']);
+                                                                      final pickLng = _asDouble(driverReq['pick_lng']);
+                                                                      final dropLat = _asDouble(driverReq['drop_lat']);
+                                                                      final dropLng = _asDouble(driverReq['drop_lng']);
+
+                                                                      final pick = (pickLat != null && pickLng != null) ? LatLng(pickLat, pickLng) : null;
+                                                                      final drop = (dropLat != null && dropLng != null) ? LatLng(dropLat, dropLng) : null;
+
+                                                                      final pickUnsafe = _safetyResultFor(pick);
+                                                                      final dropUnsafe = _safetyResultFor(drop);
+
+                                                                      return Padding(
+                                                                        padding: EdgeInsets.only(bottom: media.width * 0.015),
+                                                                        child: Row(
+                                                                          children: [
+                                                                            Expanded(
+                                                                              child: _bippSafetyPill(
+                                                                                label: 'Origen',
+                                                                                unsafe: pickUnsafe,
+                                                                                fontSize: media.width * 0.030,
+                                                                              ),
+                                                                            ),
+                                                                            const SizedBox(width: 10),
+                                                                            Expanded(
+                                                                              child: _bippSafetyPill(
+                                                                                label: 'Destino',
+                                                                                unsafe: dropUnsafe,
+                                                                                fontSize: media.width * 0.030,
+                                                                              ),
+                                                                            ),
+                                                                          ],
+                                                                        ),
+                                                                      );
+                                                                    }),
                                                                     SizedBox(
                                                                       height: media.width * 0.02,
                                                                     ),
@@ -5147,7 +5773,7 @@ class _MapsState extends State<Maps>
                                               const Duration(
                                                   milliseconds:
                                                   250),
-                                              bottom: -_panelHidden,
+                                              bottom: -_panelHidden + _sysBottom,
                                               child:
                                               GestureDetector(
                                                 onVerticalDragStart:
@@ -5242,8 +5868,7 @@ class _MapsState extends State<Maps>
                                                       width:
                                                       media.width *
                                                           1,
-                                                      height: media.height *
-                                                          1.2,
+                                                      height: _panelHeight,
                                                       decoration: BoxDecoration(
                                                         borderRadius:
                                                         const BorderRadius.only(topLeft: Radius.circular(10), topRight: Radius.circular(10)),
@@ -5822,7 +6447,7 @@ class _MapsState extends State<Maps>
                                                           Expanded(
                                                             child: SingleChildScrollView(
                                                               controller: _cont,
-                                                              physics: (addressBottom != null && addressBottom <= (media.height * 0.25)) ? const BouncingScrollPhysics() : const NeverScrollableScrollPhysics(),
+                                                              physics: (addressBottom != null && addressBottom <= (_panelOpenHidden + (media.height * 0.02))) ? const BouncingScrollPhysics() : const NeverScrollableScrollPhysics(),
                                                               child: Column(
                                                                 children: [
                                                                   if (driverReq['transport_type'] == 'delivery')
@@ -7743,7 +8368,7 @@ class _MapsState extends State<Maps>
                                               BorderRadius.circular(12)),
                                           child: Column(children: [
                                             Container(
-                                              height: media.width * 0.18,
+                                              height: math.max(media.width * 0.18, 72),
                                               width: media.width * 0.18,
                                               decoration: const BoxDecoration(
                                                   shape: BoxShape.circle,
@@ -9782,13 +10407,13 @@ class _MapsState extends State<Maps>
     return Positioned(
       left: 14,
       right: 14,
-      bottom: 10,
+      bottom: 10 + (WidgetsBinding.instance.window.viewPadding.bottom / WidgetsBinding.instance.window.devicePixelRatio),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(26),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
           child: Container(
-            height: media.width * 0.18,
+            height: math.max(media.width * 0.18, 72),
             padding: const EdgeInsets.symmetric(horizontal: 10),
             decoration: BoxDecoration(
               color: Colors.black.withOpacity(0.26),
@@ -11153,3 +11778,5 @@ class _EcgPulsePainter extends CustomPainter {
     return oldDelegate.progress != progress || oldDelegate.intensity != intensity;
   }
 }
+
+

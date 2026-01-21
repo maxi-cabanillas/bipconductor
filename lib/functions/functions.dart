@@ -1871,13 +1871,30 @@ currentPositionUpdate() async {
 
         try {
           final firebase = FirebaseDatabase.instance.ref();
+          final int isActive = (userDetails['active'] == true || userDetails['active'] == 1) ? 1 : 0;
+          final int baseAvail = (userDetails['available'] == true || userDetails['available'] == 1) ? 1 : 0;
+          final bool onTrip = (driverReq.isNotEmpty && driverReq['accepted_at'] != null && driverReq['is_completed'] == 0);
+          final int avail = (isActive == 1 && !onTrip) ? baseAvail : 0;
+
+          final geo = GeoHasher();
+          final g = geo.encode(center.longitude, center.latitude);
+
           await firebase.child('drivers/driver_${userDetails['id']}').update({
             'bearing': heading,
             'lat': center.latitude,
             'lng': center.longitude,
+            // GeoFire-style helpers
+            'l': [center.latitude, center.longitude],
+            'g': g,
+            // IMPORTANT: backend filtra por estos flags
+            'is_active': isActive,
+            'is_available': avail,
             'ts': DateTime.now().millisecondsSinceEpoch,
             'updated_at': ServerValue.timestamp,
           });
+
+          // BIP: Sync de perfil ocasional (no en cada tick)
+          bippSyncDriverProfileToFirebase();
         } catch (e) {
           if (e is SocketException) {
             internet = false;
@@ -2112,16 +2129,112 @@ userInactive() {
   final firebase = FirebaseDatabase.instance.ref();
   firebase.child('drivers/driver_${userDetails['id']}').update({
     'is_active': 0,
+    'is_available': 0,
+    'updated_at': ServerValue.timestamp,
   });
 }
 
+
+// ---------------- BIP: Sync de datos del conductor a Firebase (perfil/vehículo) ----------------
+
+int _bippLastProfileSyncMs = 0;
+
+/// Sincroniza datos "personales" y de vehículo del conductor hacia:
+/// drivers/driver_<id>
+/// Se ejecuta al conectarse (force) y luego cada pocos minutos (sin force),
+/// para que el pasajero vea nombre/vehículo y el backend pueda filtrar por vehicle_types.
+Future<void> bippSyncDriverProfileToFirebase({bool force = false}) async {
+  try {
+    if (userDetails.isEmpty || userDetails['id'] == null) return;
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!force && _bippLastProfileSyncMs != 0 && (now - _bippLastProfileSyncMs) < 5 * 60 * 1000) {
+      return;
+    }
+    _bippLastProfileSyncMs = now;
+
+    final firebase = FirebaseDatabase.instance.ref();
+    final Map<String, dynamic> data = {};
+
+    int _asIntBool(dynamic v) {
+      if (v == true) return 1;
+      if (v == false) return 0;
+      if (v is num) return v.toInt();
+      if (v is String) {
+        final s = v.trim().toLowerCase();
+        if (s == '1' || s == 'true') return 1;
+        if (s == '0' || s == 'false') return 0;
+      }
+      return 0;
+    }
+
+    void put(String k, dynamic v) {
+      if (v == null) return;
+      if (v is String && v.trim().isEmpty) return;
+      data[k] = v;
+    }
+
+    // Flags básicos del perfil
+    put('active', _asIntBool(userDetails['active']));
+    put('approve', _asIntBool(userDetails['approve']));
+
+    // Datos personales (si existen en userDetails)
+    put('id', userDetails['id']);
+    put('name', userDetails['name'] ?? userDetails['first_name'] ?? userDetails['full_name']);
+    put('mobile', userDetails['mobile'] ?? userDetails['phone']);
+    put('gender', userDetails['gender']);
+    put('profile_picture', userDetails['profile_picture'] ?? userDetails['profilePicture'] ?? userDetails['image']);
+    put('rating', userDetails['rating']);
+
+    // Datos de servicio/vehículo
+    put('service_location_id', userDetails['service_location_id']);
+    put('transport_type', userDetails['transport_type']);
+    put('vehicle_number', userDetails['vehicle_number']);
+    put('vehicle_type_icon', userDetails['vehicle_type_icon']);
+    put('vehicle_type_name', userDetails['vehicle_type_name']);
+
+    // vehicle_types: el backend lo usa para matchear el tipo
+    dynamic vt = userDetails['vehicle_types'] ?? userDetails['vehicleTypes'] ?? userDetails['vehicle_type_id'] ?? userDetails['type_id'];
+    if (vt != null) {
+      if (vt is List) {
+        data['vehicle_types'] = vt;
+      } else {
+        data['vehicle_types'] = [vt];
+      }
+    }
+
+    // Guardar (sin pisar ubicación/flags de presencia)
+    await firebase.child("drivers/driver_${userDetails['id']}").update(data);
+  } catch (_) {
+    // Nunca crashear por esto
+  }
+}
+
+// ---------------- END BIP: Sync perfil ----------------
+
+
 userActive() {
+  // BIP: al conectarse, empujar datos personales/vehículo a Firebase
+  bippSyncDriverProfileToFirebase(force: true);
+  if (center == null) return;
   final firebase = FirebaseDatabase.instance.ref();
+
+  final int baseAvail = (userDetails['available'] == true || userDetails['available'] == 1) ? 1 : 0;
+  final bool onTrip = (driverReq.isNotEmpty && driverReq['accepted_at'] != null && driverReq['is_completed'] == 0);
+  final int avail = (!onTrip) ? baseAvail : 0;
+
+  final geo = GeoHasher();
+  final g = geo.encode(center.longitude, center.latitude);
+
   firebase.child('drivers/driver_${userDetails['id']}').update({
     'is_active': 1,
-    'l': {'0': center.latitude, '1': center.longitude},
+    'is_available': avail,
+    'bearing': heading,
+    'lat': center.latitude,
+    'lng': center.longitude,
+    'l': [center.latitude, center.longitude],
+    'g': g,
     'updated_at': ServerValue.timestamp,
-    'is_available': userDetails['available'],
   });
 }
 
@@ -2173,7 +2286,7 @@ requestAccept() async {
           FirebaseDatabase.instance
               .ref()
               .child('drivers/driver_${userDetails['id']}')
-              .update({'is_available': false});
+              .update({'is_available': 0, 'updated_at': ServerValue.timestamp});
           duration = 0;
           requestStreamStart?.cancel();
           requestStreamStart = null;
@@ -3398,7 +3511,7 @@ userRating() async {
       FirebaseDatabase.instance
           .ref()
           .child('drivers/driver_${userDetails['id']}')
-          .update({'is_available': true});
+          .update({'is_available': 1, 'updated_at': ServerValue.timestamp});
       await getUserDetails();
       result = true;
     } else if (response.statusCode == 401) {
@@ -4388,6 +4501,8 @@ userLogout() async {
         final position = FirebaseDatabase.instance.ref();
         position.child('drivers/driver_$id').update({
           'is_active': 0,
+          'is_available': 0,
+          'updated_at': ServerValue.timestamp,
         });
       }
       rideStreamStart?.cancel();
