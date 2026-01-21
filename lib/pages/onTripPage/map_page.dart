@@ -83,6 +83,13 @@ dynamic isAvailable;
 List vechiletypeslist = [];
 List<fmlt.LatLng> fmpoly = [];
 
+class _NearestSnapPoint {
+  const _NearestSnapPoint(this.point, this.distanceMeters);
+
+  final LatLng point;
+  final double distanceMeters;
+}
+
 class _MapsState extends State<Maps>
     with WidgetsBindingObserver, TickerProviderStateMixin {
   List driverData = [];
@@ -668,7 +675,22 @@ class _MapsState extends State<Maps>
             }
             _lastLivePosHandledAt = now;
 
-            final latLng = LatLng(pos.latitude, pos.longitude);
+            const double snapMaxDistanceMeters = 35.0;
+            const double snapMaxAccuracyMeters = 100.0;
+            final rawLatLng = LatLng(pos.latitude, pos.longitude);
+            final accuracy = pos.accuracy;
+            LatLng displayLatLng = rawLatLng;
+
+            final snapCandidate = _nearestPolylinePoint(
+              rawLatLng,
+              maxDistanceMeters: snapMaxDistanceMeters,
+            );
+            final shouldSnap = accuracy <= snapMaxAccuracyMeters &&
+                snapCandidate != null &&
+                snapCandidate.distanceMeters <= snapMaxDistanceMeters;
+            if (shouldSnap) {
+              displayLatLng = snapCandidate.point;
+            }
 
             double newHeading;
 
@@ -676,18 +698,18 @@ class _MapsState extends State<Maps>
               final moved = geolocator.Geolocator.distanceBetween(
                 _prevDriverLatLng!.latitude,
                 _prevDriverLatLng!.longitude,
-                latLng.latitude,
-                latLng.longitude,
+                rawLatLng.latitude,
+                rawLatLng.longitude,
               );
 
               // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
               // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
               if (moved >= 2.0) {
-                newHeading = _bearingBetween(_prevDriverLatLng!, latLng);
+                newHeading = _bearingBetween(_prevDriverLatLng!, rawLatLng);
 
                 // Only advance the reference point when movement is real;
                 // otherwise small GPS jitter can create random bearings.
-                _prevDriverLatLng = latLng;
+                _prevDriverLatLng = rawLatLng;
               } else {
                 newHeading = heading; // keep last stable heading
               }
@@ -696,7 +718,7 @@ class _MapsState extends State<Maps>
               final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
               newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
 
-              _prevDriverLatLng = latLng;
+              _prevDriverLatLng = rawLatLng;
             }
 
             // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
@@ -712,8 +734,8 @@ class _MapsState extends State<Maps>
 
             newHeading = _wrap360(newHeading);
 
-            center = latLng;
-            currentLocation = latLng;
+            center = displayLatLng;
+            currentLocation = displayLatLng;
             heading = newHeading;
 
             // 🔁 Recalcular y redibujar la ruta en cada update de GPS
@@ -723,21 +745,21 @@ class _MapsState extends State<Maps>
                   now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 4;
               if (shouldCheckDeviation) {
                 _lastRouteDeviationCheckAt = now;
-                await handleRouteDeviationAndSnap(offRouteMeters: 50);
+                handleRouteDeviationAndSnap(offRouteMeters: 50);
               }
             }
 
             // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
 
-            final shouldUpdateUi = _shouldUpdateDriverUi(latLng, newHeading);
+            final shouldUpdateUi = _shouldUpdateDriverUi(displayLatLng, newHeading);
             if (shouldUpdateUi) {
-              _lastUiDriverLatLng = latLng;
+              _lastUiDriverLatLng = displayLatLng;
               _lastUiDriverHeading = newHeading;
 
-              _updateDriverMarker(latLng, newHeading);
+              _updateDriverMarker(displayLatLng, newHeading);
 
               if (_followDriver) {
-                _animateToDriver(latLng, newHeading);
+                _animateToDriver(displayLatLng, newHeading);
               }
 
               valueNotifierHome.incrementNotifier();
@@ -760,6 +782,52 @@ class _MapsState extends State<Maps>
         _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
 
     return moved >= 5.0 || headingDelta >= 3.0;
+  }
+
+  _NearestSnapPoint? _nearestPolylinePoint(
+    LatLng rawLatLng, {
+    double maxDistanceMeters = double.infinity,
+  }) {
+    final List<dynamic> snapPoints = mapType == 'google' ? polyList : fmpoly;
+    if (snapPoints.isEmpty) return null;
+
+    int step = (snapPoints.length / 80).ceil();
+    if (step < 1) step = 1;
+
+    double minD = double.infinity;
+    LatLng? nearest;
+
+    for (int i = 0; i < snapPoints.length; i += step) {
+      final p = snapPoints[i];
+      double? lat;
+      double? lng;
+      if (p is LatLng) {
+        lat = p.latitude;
+        lng = p.longitude;
+      } else if (p is fmlt.LatLng) {
+        lat = p.latitude;
+        lng = p.longitude;
+      }
+      if (lat == null || lng == null) {
+        continue;
+      }
+      final d = geolocator.Geolocator.distanceBetween(
+        rawLatLng.latitude,
+        rawLatLng.longitude,
+        lat,
+        lng,
+      );
+      if (d < minD) {
+        minD = d;
+        nearest = LatLng(lat, lng);
+        if (minD <= maxDistanceMeters && minD <= 3.0) {
+          break;
+        }
+      }
+    }
+
+    if (nearest == null) return null;
+    return _NearestSnapPoint(nearest, minD);
   }
 
   /// Clear ONLY route polylines (does not touch markers).
@@ -936,14 +1004,16 @@ class _MapsState extends State<Maps>
 
     _routeRebuildInProgress = true;
     _lastRouteRebuildAt = now;
-    try {
-      await rebuildRoutePolylinesFromCurrent();
-      syncGooglePolylineFromPolyList();
-    } catch (_) {
-      // If rebuild fails, keep the current polyline.
-    } finally {
-      _routeRebuildInProgress = false;
-    }
+    () async {
+      try {
+        await rebuildRoutePolylinesFromCurrent();
+        syncGooglePolylineFromPolyList();
+      } catch (_) {
+        // If rebuild fails, keep the current polyline.
+      } finally {
+        _routeRebuildInProgress = false;
+      }
+    }();
   }
 
 
