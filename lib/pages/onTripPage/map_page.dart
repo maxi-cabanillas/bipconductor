@@ -3,12 +3,14 @@
 import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' as ui;
+import 'dart:typed_data';
 // import 'package:dash_bubble/dash_bubble.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_driver/pages/login/landingpage.dart';
 import 'package:flutter_driver/pages/login/login.dart';
@@ -93,6 +95,9 @@ class _MapsState extends State<Maps>
   bool _pickAnimateDone = false;
   dynamic addressBottom;
   dynamic _addressBottom;
+
+  // Auto-open the on-ride bottom sheet once per trip so the driver can see Origen/Destino/Precio sin arrastrar.
+  bool _bippAutoOpenOnRidePanel = false;
   bool fmPolyGot = false;
   late geolocator.LocationPermission permission;
   Location location = Location();
@@ -107,14 +112,155 @@ class _MapsState extends State<Maps>
 
   // Uber/Didi style: rotate camera to driver heading and keep the car icon pointing "forward" (up) on screen.
   bool _followBearing = true; // false when user moves the map manually
+  // Auto re-follow (tipo Google Maps): si el usuario panea, se apaga el follow; a los 10s vuelve solo.
+  Timer? _bippAutoFollowTimer;
+  static const Duration _bippAutoFollowDelay = Duration(seconds: 10);
+  static const double _bippPanDisableMeters = 65.0;
+
+  LatLng? _bippDriverLatLngNow() {
+    try {
+      if (_uiDisplayLatLng != null) return _uiDisplayLatLng;
+      if (_lastFixLatLng != null) return _lastFixLatLng;
+      if (center != null && center is LatLng) return center as LatLng;
+      if (currentLocation.latitude != 0.0 || currentLocation.longitude != 0.0) return currentLocation;
+    } catch (_) {}
+    return null;
+  }
+
+  void _bippCancelAutoFollow() {
+    _bippAutoFollowTimer?.cancel();
+    _bippAutoFollowTimer = null;
+  }
+
+  void _bippScheduleAutoFollow() {
+    _bippCancelAutoFollow();
+    _bippAutoFollowTimer = Timer(_bippAutoFollowDelay, () {
+      if (!mounted) return;
+      _bippResumeFollowNow();
+    });
+  }
+
+  void _bippResumeFollowNow() {
+    _bippCancelAutoFollow();
+    final p = _bippDriverLatLngNow();
+    if (p == null) return;
+
+    if (mounted) {
+      setState(() {
+        _followDriver = true;
+        _followBearing = true;
+      });
+    } else {
+      _followDriver = true;
+      _followBearing = true;
+    }
+
+    final desiredBearing = _wrap360(_headingDeg);
+    _markProgrammaticCameraMove(const Duration(milliseconds: 900));
+    _controller?.moveCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(target: p, zoom: _currentZoom, bearing: desiredBearing),
+      ),
+    );
+  }
+
+  void _bippOnUserCameraMoveStarted() {
+    if (_isProgrammaticCameraMove()) return;
+    _bippCancelAutoFollow();
+  }
+
+  void _bippOnUserCameraMove(CameraPosition pos) {
+    _currentZoom = pos.zoom;
+    if (_isProgrammaticCameraMove()) return;
+
+    final driver = _bippDriverLatLngNow();
+    if (driver == null) return;
+
+    final dist = geolocator.Geolocator.distanceBetween(
+      driver.latitude,
+      driver.longitude,
+      pos.target.latitude,
+      pos.target.longitude,
+    );
+
+    // Pinch/zoom mantiene el target cerca del driver. Pan se va lejos => desactivamos follow.
+    if (_followDriver && dist > _bippPanDisableMeters) {
+      if (mounted) {
+        setState(() {
+          _followDriver = false;
+          _followBearing = false;
+        });
+      } else {
+        _followDriver = false;
+        _followBearing = false;
+      }
+      _bippScheduleAutoFollow();
+      return;
+    }
+
+    // Si ya estás en manual, reprogramá el auto-follow para 10s después del último toque.
+    if (!_followDriver) {
+      _bippScheduleAutoFollow();
+    }
+  }
+
+  void _bippOnUserCameraIdle() {
+    if (_isProgrammaticCameraMove()) return;
+    if (!_followDriver) {
+      _bippScheduleAutoFollow();
+    }
+  }
+
+
+  // Used to ignore onCameraMoveStarted events triggered by our own animate/move camera calls.
+  DateTime? _programmaticCameraMoveUntil;
+  DateTime? _mapCreatedAt;
+  void _markProgrammaticCameraMove([Duration d = const Duration(milliseconds: 1200)]) {
+    _programmaticCameraMoveUntil = DateTime.now().add(d);
+  }
+
+  bool _isProgrammaticCameraMove() {
+    final until = _programmaticCameraMoveUntil;
+    return until != null && DateTime.now().isBefore(until);
+  }
+
   double _currentZoom = 18.0;
   double _cameraBearing = 0.0; // last applied camera bearing (deg)
+  double _headingDeg = 0.0;
+  double _camBearingDeg = 0.0;
   DateTime _lastCameraMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _prevDriverLatLng;
   DateTime? _lastLivePosHandledAt;
   DateTime? _lastRouteDeviationCheckAt;
-  LatLng? _lastUiDriverLatLng;
-  double _lastUiDriverHeading = 0.0;
+  Ticker? _uiSmoothingTicker;
+  LatLng? _uiTargetLatLng;
+  double _uiTargetHeading = 0.0;
+  LatLng? _uiDisplayLatLng;
+  double _uiDisplayHeading = 0.0;
+  DateTime? _uiLastTick;
+  DateTime? _uiLastNotifyAt;
+  LatLng? _lastCameraTarget;
+  LatLng? _lastSnappedLatLng;
+  LatLng? _lastFixLatLng;
+  DateTime? _lastFixAt;
+  double _lastFixSpeed = 0.0;
+  double _lastFixAccuracy = 0.0;
+  DateTime? _lastDebugAt;
+  int _offRouteConsecutive = 0;
+
+  // Polyline repaint throttle (avoid heavy redraws causing skipped frames)
+  DateTime? _lastPolylinePaintAt;
+  int _lastPolylinePaintSig = 0;
+  Timer? _polylinePaintTimer;
+  static const Duration _polylinePaintMinInterval = Duration(milliseconds: 650);
+
+  static const Duration _uiFrameInterval = Duration(milliseconds: 100);
+  static const Duration _uiSmoothingWindow = Duration(milliseconds: 1200);
+  static const Duration _uiNotifyInterval = Duration(milliseconds: 300);
+  static const double _cameraMinMoveMeters = 2.5;
+  static const double _cameraMinHeadingDelta = 2.5;
+  static const double _maxPredictionMeters = 12.0;
+  static const double _snapHardDistanceMeters = 10.0;
 
   final fm.MapController _fmController = fm.MapController();
   Animation<double>? _animation;
@@ -125,6 +271,14 @@ class _MapsState extends State<Maps>
   // BIP: cache/refresh de stats de hoy (viajes + ganancia) para el panel superior
   int _bippLastTodayStatsFetchMs = 0;
   bool _bippTodayStatsFetchInFlight = false;
+
+  // BIP: Zonas no seguras (Google My Maps KML)
+  static const String _bippUnsafeZonesKmlUrl =
+      'https://www.google.com/maps/d/u/0/kml?mid=1cHf6_AvF2KQ7n64qGrruVmXY7T9-nlQ&forcekml=1';
+  bool _showUnsafeZones = true;
+  bool _unsafeZonesLoadedOnce = false;
+  bool _unsafeZonesLoadOk = false;
+  Set<Polygon> _unsafeZonePolygons = <Polygon>{};
 
 
   dynamic animationController;
@@ -387,73 +541,111 @@ class _MapsState extends State<Maps>
   }
 
 
+  Future<Uint8List> _drawBlueNavArrowPng({required int sizePx}) async {
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final size = Size(sizePx.toDouble(), sizePx.toDouble());
+
+    // Fondo transparente
+    final clearPaint = Paint()..blendMode = BlendMode.clear;
+    canvas.drawRect(Offset.zero & size, clearPaint);
+
+    final w = size.width;
+    final h = size.height;
+
+    // Flecha tipo Google/Waze: punta arriba + base con "mordida"
+    final tip = Offset(w * 0.50, h * 0.10);
+    final right = Offset(w * 0.84, h * 0.88);
+    final notch = Offset(w * 0.50, h * 0.62);
+    final left = Offset(w * 0.16, h * 0.88);
+
+    final path = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(right.dx, right.dy)
+      ..lineTo(notch.dx, notch.dy)
+      ..lineTo(left.dx, left.dy)
+      ..close();
+
+    // Sombra suave
+    canvas.drawShadow(path, Colors.black.withOpacity(0.45), w * 0.06, true);
+
+    // Borde blanco "premium"
+    final stroke = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = w * 0.075
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round
+      ..color = Colors.white.withOpacity(0.95);
+    canvas.drawPath(path, stroke);
+
+    // Relleno con degradé (azul Google)
+    final fill = Paint()
+      ..style = PaintingStyle.fill
+      ..shader = ui.Gradient.linear(
+        Offset(w * 0.22, h * 0.18),
+        Offset(w * 0.82, h * 0.90),
+        const [
+          Color(0xFF64B5F6),
+          Color(0xFF1E88E5),
+          Color(0xFF0D47A1),
+        ],
+        const [0.0, 0.55, 1.0],
+      );
+    canvas.drawPath(path, fill);
+
+    // Faceta izquierda (más oscura) para efecto 3D
+    final leftFacet = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(notch.dx, notch.dy)
+      ..lineTo(left.dx, left.dy)
+      ..close();
+    final leftPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = const Color(0xFF082E6E).withOpacity(0.30);
+    canvas.drawPath(leftFacet, leftPaint);
+
+    // Faceta derecha (highlight)
+    final rightFacet = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(right.dx, right.dy)
+      ..lineTo(notch.dx, notch.dy)
+      ..close();
+    final rightPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.white.withOpacity(0.10);
+    canvas.drawPath(rightFacet, rightPaint);
+
+    // Destello superior
+    final glint = Path()
+      ..moveTo(w * 0.50, h * 0.18)
+      ..lineTo(w * 0.64, h * 0.44)
+      ..lineTo(w * 0.50, h * 0.40)
+      ..lineTo(w * 0.36, h * 0.44)
+      ..close();
+    final glintPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.white.withOpacity(0.22);
+    canvas.drawPath(glint, glintPaint);
+
+    final picture = recorder.endRecording();
+    final img = await picture.toImage(sizePx, sizePx);
+    final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+    return bytes!.buffer.asUint8List();
+  }
+
 
   Future<void> _ensureDriverGoogleArrowIcon() async {
+    // Icono del conductor (Google Maps): flecha azul tipo Google/Waze (sin F1).
     if (_driverGoogleArrowIcon != null) return;
 
-    const int size = 110; // px (sharp enough on most screens)
-    final ui.PictureRecorder recorder = ui.PictureRecorder();
-    final Canvas canvas = Canvas(recorder);
-    final double s = size.toDouble();
+    const int targetPx = 180; // MÁS grande (antes estaba chico)
 
-    // Shadow
-    final Paint shadow = Paint()
-      ..color = const Color(0x66000000)
-      ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 10);
-
-    // Outer (white) shape
-    final Paint outer = Paint()..color = Colors.white;
-
-    // Inner (Google blue) shape
-    final Paint inner = Paint()..color = const Color(0xFF1A73E8);
-
-    // Arrow path (points UP by default)
-    final Path arrow = Path()
-      ..moveTo(s * 0.50, s * 0.06)
-      ..lineTo(s * 0.88, s * 0.92)
-      ..lineTo(s * 0.50, s * 0.76)
-      ..lineTo(s * 0.12, s * 0.92)
-      ..close();
-
-    // Draw shadow (slight down-right)
-    canvas.save();
-    canvas.translate(2, 3);
-    canvas.drawPath(arrow, shadow);
-    canvas.restore();
-
-    // Draw white border by drawing a slightly larger arrow behind
-    canvas.save();
-    canvas.translate(s * 0.50, s * 0.55);
-    canvas.scale(1.06, 1.06);
-    canvas.translate(-s * 0.50, -s * 0.55);
-    canvas.drawPath(arrow, outer);
-    canvas.restore();
-
-    // Draw blue arrow on top
-    canvas.drawPath(arrow, inner);
-
-    // Tiny highlight (gives a "Google" feel)
-    final Paint highlight = Paint()
-      ..color = const Color(0x3329B6F6)
-      ..style = PaintingStyle.fill;
-
-    final Path hl = Path()
-      ..moveTo(s * 0.50, s * 0.12)
-      ..lineTo(s * 0.75, s * 0.86)
-      ..lineTo(s * 0.50, s * 0.72)
-      ..lineTo(s * 0.25, s * 0.86)
-      ..close();
-
-    canvas.drawPath(hl, highlight);
-
-    final ui.Image img = await recorder.endRecording().toImage(size, size);
-    final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
-    if (byteData == null) return;
-
-    _driverGoogleArrowIcon =
-        BitmapDescriptor.fromBytes(byteData.buffer.asUint8List());
-
-    if (mounted) setState(() {});
+    try {
+      final png = await _drawBlueNavArrowPng(sizePx: targetPx);
+      _driverGoogleArrowIcon = BitmapDescriptor.fromBytes(png);
+    } catch (_) {
+      // fallback: null => usa pinLocationIcon*
+    }
   }
 
 
@@ -495,6 +687,197 @@ class _MapsState extends State<Maps>
     }
   }
 
+  // BIP: helpers para zonas no seguras
+
+  Future<void> _loadUnsafeZonesFromKml() async {
+    _unsafeZonesLoadedOnce = true;
+    try {
+      final res = await http.get(Uri.parse(_bippUnsafeZonesKmlUrl));
+      if (res.statusCode != 200) {
+        _unsafeZonesLoadOk = false;
+        return;
+      }
+      final polys = _parseKmlPolygons(res.body);
+      if (!mounted) return;
+      setState(() {
+        _unsafeZonePolygons = polys;
+        _unsafeZonesLoadOk = polys.isNotEmpty;
+      });
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Set<Polygon> _parseKmlPolygons(String kml) {
+    final Set<Polygon> out = <Polygon>{};
+    try {
+      final coordRe = RegExp(r'<coordinates>([\s\S]*?)</coordinates>', caseSensitive: false);
+      int idx = 0;
+      for (final m in coordRe.allMatches(kml)) {
+        final raw = (m.group(1) ?? '').trim();
+        final pts = _parseKmlCoordinateString(raw);
+        if (pts.length < 3) continue;
+        idx += 1;
+        out.add(
+          Polygon(
+            polygonId: PolygonId('unsafe_$idx'),
+            points: pts,
+            strokeWidth: 2,
+            strokeColor: Colors.red,
+            fillColor: Colors.red.withOpacity(0.20),
+            geodesic: true,
+          ),
+        );
+      }
+    } catch (_) {
+      // ignore
+    }
+    return out;
+  }
+
+  List<LatLng> _parseKmlCoordinateString(String raw) {
+    final pts = <LatLng>[];
+    // KML: lon,lat[,alt] separados por espacios/nuevas líneas
+    for (final part in raw.split(RegExp(r'\s+'))) {
+      final t = part.trim();
+      if (t.isEmpty) continue;
+      final seg = t.split(',');
+      if (seg.length < 2) continue;
+      final lon = double.tryParse(seg[0]);
+      final lat = double.tryParse(seg[1]);
+      if (lat == null || lon == null) continue;
+      pts.add(LatLng(lat, lon));
+    }
+    // Algunos KML repiten el primer punto al final: lo removemos para evitar doble punto
+    if (pts.length >= 2) {
+      final a = pts.first;
+      final b = pts.last;
+      if ((a.latitude - b.latitude).abs() < 1e-10 && (a.longitude - b.longitude).abs() < 1e-10) {
+        pts.removeLast();
+      }
+    }
+    return pts;
+  }
+
+  bool _pointInPolygon(LatLng p, List<LatLng> poly) {
+    // Ray casting
+    final x = p.longitude;
+    final y = p.latitude;
+    bool inside = false;
+    for (int i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      final xi = poly[i].longitude;
+      final yi = poly[i].latitude;
+      final xj = poly[j].longitude;
+      final yj = poly[j].latitude;
+
+      final intersect = ((yi > y) != (yj > y)) &&
+          (x < (xj - xi) * (y - yi) / ((yj - yi) == 0 ? 1e-12 : (yj - yi)) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  bool _isUnsafeLatLng(LatLng p) {
+    for (final poly in _unsafeZonePolygons) {
+      final pts = poly.points;
+      if (pts.length < 3) continue;
+      if (_pointInPolygon(p, pts)) return true;
+    }
+    return false;
+  }
+
+  bool? _safetyResultFor(LatLng? p) {
+    if (p == null) return null;
+    if (!_unsafeZonesLoadedOnce) return null;
+    if (!_unsafeZonesLoadOk) return null;
+    return _isUnsafeLatLng(p);
+  }
+
+  Widget _bippSafetyPill({
+    required String label,
+    required bool? unsafe,
+    required double fontSize,
+  }) {
+    final isUnknown = unsafe == null;
+    final isUnsafe = unsafe == true;
+
+    final text = isUnknown
+        ? '$label: ...'
+        : '$label: ${isUnsafe ? 'INSEGURO' : 'SEGURO'}';
+
+    final Color border = isUnknown
+        ? Colors.white.withOpacity(0.35)
+        : (isUnsafe ? Colors.red : Colors.green);
+
+    final Color bg = isUnknown
+        ? Colors.white.withOpacity(0.08)
+        : (isUnsafe ? Colors.red.withOpacity(0.15) : Colors.green.withOpacity(0.15));
+
+    final IconData icon = isUnknown
+        ? Icons.help_outline
+        : (isUnsafe ? Icons.warning_amber_rounded : Icons.verified_rounded);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: border, width: 1),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, size: fontSize + 2, color: border),
+          const SizedBox(width: 6),
+          Text(
+            text,
+            style: GoogleFonts.notoSans(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w800,
+              color: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+
+
+  /// BIP: calcula distancia/tiempo aproximados desde el cliente (origen) hasta el destino
+  /// usando coordenadas pick_* y drop_* del driverReq.
+  /// No usa Directions (0 costo extra de Google), es aproximación en línea recta.
+  Map<String, String>? _bippPickupToDropInfo() {
+    try {
+      if (driverReq.isEmpty) return null;
+
+      final dynamic rawRental = driverReq['is_rental'];
+      final bool isRental = rawRental == true || rawRental == 1 || rawRental?.toString() == '1';
+      if (isRental) return null;
+
+      final pickLat = _asDouble(driverReq['pick_lat']);
+      final pickLng = _asDouble(driverReq['pick_lng']);
+      final dropLat = _asDouble(driverReq['drop_lat']);
+      final dropLng = _asDouble(driverReq['drop_lng']);
+      if (pickLat == null || pickLng == null || dropLat == null || dropLng == null) return null;
+
+      final meters = geolocator.Geolocator.distanceBetween(pickLat, pickLng, dropLat, dropLng);
+      final km = meters / 1000.0;
+
+      // Estimación simple de minutos (promedio urbano ~30 km/h).
+      // mins = km / 30 * 60 = km * 2
+      final int mins = (km * 2.0).round().clamp(1, 9999);
+
+      return {
+        'km': km.toStringAsFixed(2),
+        'mins': mins.toString(),
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
   // final platforms = const MethodChannel('flutter.app/awake');
   @override
   void initState() {
@@ -516,6 +899,8 @@ class _MapsState extends State<Maps>
     getLocs();
     _startLiveDriverTracking();
     getonlineoffline();
+    _loadUnsafeZonesFromKml();
+
 
 
     // Animación estética para el texto "BUSCANDO VIAJE"
@@ -541,6 +926,7 @@ class _MapsState extends State<Maps>
     setState(() {
       _controller = controller;
       _controller?.setMapStyle(mapStyle);
+      _mapCreatedAt = DateTime.now();
     });
     if ((choosenRide.isNotEmpty || driverReq.isNotEmpty) &&
         _pickAnimateDone == false) {
@@ -645,121 +1031,211 @@ class _MapsState extends State<Maps>
           permStatus == geolocator.LocationPermission.deniedForever) {
         return;
       }
+      positionStreamData();
+      _startUiSmoothingTicker();
 
-      final settings = Platform.isAndroid
-          ? const geolocator.AndroidSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              distanceFilter: 10,
-              intervalDuration: Duration(seconds: 5),
-            )
-          : const geolocator.AppleSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              activityType: geolocator.ActivityType.otherNavigation,
-              distanceFilter: 10,
-            );
+      _livePosSub = positionStreamUpdates.listen((pos) async {
+        final now = DateTime.now();
+        if (_lastLivePosHandledAt != null &&
+            now.difference(_lastLivePosHandledAt!).inMilliseconds < 220) {
+          return;
+        }
+        _lastLivePosHandledAt = now;
 
-      _livePosSub =
-          geolocator.Geolocator.getPositionStream(locationSettings: settings)
-              .listen((pos) async {
-            final now = DateTime.now();
-            if (_lastLivePosHandledAt != null &&
-                now.difference(_lastLivePosHandledAt!).inMilliseconds < 700) {
-              return;
-            }
-            _lastLivePosHandledAt = now;
+        final rawLatLng = LatLng(pos.latitude, pos.longitude);
 
-            final latLng = LatLng(pos.latitude, pos.longitude);
+        double newHeading;
 
-            double newHeading;
+        if (pos.accuracy > 50.0) {
+          return;
+        }
 
-            if (_prevDriverLatLng != null) {
-              final moved = geolocator.Geolocator.distanceBetween(
-                _prevDriverLatLng!.latitude,
-                _prevDriverLatLng!.longitude,
-                latLng.latitude,
-                latLng.longitude,
-              );
+        if (_prevDriverLatLng != null) {
+          final moved = geolocator.Geolocator.distanceBetween(
+            _prevDriverLatLng!.latitude,
+            _prevDriverLatLng!.longitude,
+            rawLatLng.latitude,
+            rawLatLng.longitude,
+          );
 
-              // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
-              // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
-              if (moved >= 2.0) {
-                newHeading = _bearingBetween(_prevDriverLatLng!, latLng);
+          // Prefer bearing computed from real GPS movement (more reliable than sensor heading).
+          // This avoids the "crossed" rotation you see when Android reports a non-zero but wrong heading.
+          if (moved >= 2.0) {
+            newHeading = _bearingBetween(_prevDriverLatLng!, rawLatLng);
 
-                // Only advance the reference point when movement is real;
-                // otherwise small GPS jitter can create random bearings.
-                _prevDriverLatLng = latLng;
-              } else {
-                newHeading = heading; // keep last stable heading
-              }
-            } else {
-              // First fix: use sensor heading if available (may be 0 / NaN at low speed).
-              final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
-              newHeading = (sensorHeading == 0.0) ? heading : sensorHeading;
+            // Only advance the reference point when movement is real;
+            // otherwise small GPS jitter can create random bearings.
+            _prevDriverLatLng = rawLatLng;
+          } else {
+            newHeading = heading; // keep last stable heading
+          }
+        } else {
+          final sensorHeading = (pos.heading.isNaN) ? 0.0 : pos.heading;
+          final useSensor = pos.speed > 3.0 && sensorHeading != 0.0;
+          newHeading = useSensor ? sensorHeading : heading;
 
-              _prevDriverLatLng = latLng;
-            }
+          _prevDriverLatLng = rawLatLng;
+        }
 
-            // Optional: small blend toward sensor heading when it's close (reduces lag at speed).
-            final sensorHeading2 = (pos.heading.isNaN) ? 0.0 : pos.heading;
-            if (sensorHeading2 != 0.0) {
-              final delta = _shortestAngleDelta(newHeading, sensorHeading2).abs();
-              if (delta <= 20.0) {
-                newHeading = _wrap360(
-                  newHeading + _shortestAngleDelta(newHeading, sensorHeading2) * 0.25,
-                );
-              }
-            }
+        newHeading = _wrap360(newHeading);
 
-            newHeading = _wrap360(newHeading);
+        center = rawLatLng;
+        currentLocation = rawLatLng;
 
-            center = latLng;
-            currentLocation = latLng;
-            heading = newHeading;
+        final hasRoute = polyList.length >= 2;
+        final snap = hasRoute ? _snapToPolyline(rawLatLng, polyList) : null;
+        final snappedLatLng = snap?.position ?? rawLatLng;
+        final snappedHeading = _resolveHeadingTarget(
+          rawLatLng: rawLatLng,
+          fallbackHeading: newHeading,
+          snapHeading: snap?.heading,
+        );
 
-            // 🔁 Recalcular y redibujar la ruta en cada update de GPS
-            // (OJO: esto puede consumir cuota/costo de la API de rutas si lo dejás muy seguido)
-            if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
-              final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
-                  now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 4;
-              if (shouldCheckDeviation) {
-                _lastRouteDeviationCheckAt = now;
-                await handleRouteDeviationAndSnap(offRouteMeters: 50);
-              }
-            }
+        _headingDeg = _smoothAngle(_headingDeg, snappedHeading, 0.20);
+        heading = _headingDeg;
+        _lastSnappedLatLng = snappedLatLng;
+        _lastFixLatLng = snappedLatLng;
+        _lastFixAt = pos.timestamp ?? now;
+        _lastFixSpeed = pos.speed;
+        _lastFixAccuracy = pos.accuracy;
+        updateDriverLocationSettings(
+          onTrip: driverReq.isNotEmpty && driverReq['accepted_at'] != null,
+          speed: pos.speed,
+          accuracy: pos.accuracy,
+        );
 
-            // _prevDriverLatLng is managed above (movement threshold) to avoid jitter bearings.
+        if (driverReq.isNotEmpty && driverReq['accepted_at'] != null) {
+          final shouldCheckDeviation = _lastRouteDeviationCheckAt == null ||
+              now.difference(_lastRouteDeviationCheckAt!).inSeconds >= 12;
+          if (shouldCheckDeviation) {
+            _lastRouteDeviationCheckAt = now;
+            await handleRouteDeviationAndSnap(offRouteMeters: 70);
+          }
+        }
 
-            final shouldUpdateUi = _shouldUpdateDriverUi(latLng, newHeading);
-            if (shouldUpdateUi) {
-              _lastUiDriverLatLng = latLng;
-              _lastUiDriverHeading = newHeading;
+        _uiTargetLatLng = snappedLatLng;
+        _uiTargetHeading = _headingDeg;
 
-              _updateDriverMarker(latLng, newHeading);
+        if (_uiDisplayLatLng == null) {
+          _uiDisplayLatLng = snappedLatLng;
+          _uiDisplayHeading = _headingDeg;
+          _updateDriverMarker(snappedLatLng, _headingDeg);
+          valueNotifierHome.incrementNotifier();
+        }
 
-              if (_followDriver) {
-                _animateToDriver(latLng, newHeading);
-              }
+        if (_followDriver) {
+          _animateToDriver(snappedLatLng, snappedHeading);
+        }
 
-              valueNotifierHome.incrementNotifier();
-            }
-          });
+        if (_lastDebugAt == null ||
+            now.difference(_lastDebugAt!).inSeconds >= 1) {
+          _lastDebugAt = now;
+          final uiLag = (_uiDisplayLatLng == null)
+              ? 0.0
+              : geolocator.Geolocator.distanceBetween(
+            _uiDisplayLatLng!.latitude,
+            _uiDisplayLatLng!.longitude,
+            snappedLatLng.latitude,
+            snappedLatLng.longitude,
+          );
+          final ageMs = (pos.timestamp == null)
+              ? 0
+              : now.difference(pos.timestamp!).inMilliseconds;
+          final modeLabel = (driverReq.isNotEmpty && driverReq['accepted_at'] != null)
+              ? 'trip'
+              : (pos.speed >= 1.5)
+              ? 'moving'
+              : 'idle';
+          debugPrint(
+              'loc dbg mode=$modeLabel acc=${pos.accuracy.toStringAsFixed(1)}m '
+                  'speed=${pos.speed.toStringAsFixed(2)}m/s age=${ageMs}ms '
+                  'uiLag=${uiLag.toStringAsFixed(1)}m');
+        }
+      });
     } catch (_) {}
   }
 
-  bool _shouldUpdateDriverUi(LatLng latLng, double newHeading) {
-    if (_lastUiDriverLatLng == null) return true;
+  void _startUiSmoothingTicker() {
+    if (_uiSmoothingTicker != null) return;
 
-    final moved = geolocator.Geolocator.distanceBetween(
-      _lastUiDriverLatLng!.latitude,
-      _lastUiDriverLatLng!.longitude,
-      latLng.latitude,
-      latLng.longitude,
-    );
+    _uiSmoothingTicker = createTicker((_) {
+      final now = DateTime.now();
+      if (_uiLastTick != null &&
+          now.difference(_uiLastTick!) < _uiFrameInterval) {
+        return;
+      }
+      _uiLastTick = now;
 
-    final headingDelta =
-        _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
+      if (_uiTargetLatLng == null) return;
+      final target = _uiTargetLatLng!;
+      final current = _uiDisplayLatLng ?? target;
 
-    return moved >= 5.0 || headingDelta >= 3.0;
+      LatLng targetForFrame = target;
+      if (_lastFixLatLng != null && _lastFixAt != null && _lastFixSpeed > 0.1) {
+        final dtSeconds =
+            now.difference(_lastFixAt!).inMilliseconds / 1000.0;
+        if (dtSeconds > 0) {
+          final predictedMeters =
+          (_lastFixSpeed * dtSeconds).clamp(0.0, _maxPredictionMeters);
+          if (predictedMeters > 0.5) {
+            targetForFrame = _projectLatLng(
+              _lastFixLatLng!,
+              _headingDeg,
+              predictedMeters,
+            );
+          }
+        }
+      }
+
+      final frameMs = _uiFrameInterval.inMilliseconds.toDouble();
+      final smoothMs = _uiSmoothingWindow.inMilliseconds.toDouble();
+      final alpha = (frameMs / smoothMs).clamp(0.08, 1.0);
+
+      final nextLat =
+          current.latitude + (targetForFrame.latitude - current.latitude) * alpha;
+      final nextLng =
+          current.longitude + (targetForFrame.longitude - current.longitude) * alpha;
+      final nextHeading = _wrap360(
+        _uiDisplayHeading +
+            _shortestAngleDelta(_uiDisplayHeading, _uiTargetHeading) * alpha,
+      );
+
+      final moved = geolocator.Geolocator.distanceBetween(
+        current.latitude,
+        current.longitude,
+        targetForFrame.latitude,
+        targetForFrame.longitude,
+      );
+      final headingDelta =
+      _shortestAngleDelta(_uiDisplayHeading, nextHeading).abs();
+      if (moved < 0.5 && headingDelta < 1.0) {
+        return;
+      }
+
+      if (moved > _snapHardDistanceMeters) {
+        _uiDisplayLatLng = targetForFrame;
+      } else {
+        _uiDisplayLatLng = LatLng(nextLat, nextLng);
+      }
+      _uiDisplayHeading = nextHeading;
+
+      _updateDriverMarker(_uiDisplayLatLng!, _uiDisplayHeading);
+      if (_uiLastNotifyAt == null ||
+          now.difference(_uiLastNotifyAt!) >= _uiNotifyInterval) {
+        _uiLastNotifyAt = now;
+        valueNotifierHome.incrementNotifier();
+      }
+    });
+
+    _uiSmoothingTicker?.start();
+  }
+
+  void _stopUiSmoothingTicker() {
+    _uiSmoothingTicker?.stop();
+    _uiSmoothingTicker?.dispose();
+    _uiSmoothingTicker = null;
+    _uiLastTick = null;
+    _uiLastNotifyAt = null;
   }
 
   /// Clear ONLY route polylines (does not touch markers).
@@ -777,20 +1253,160 @@ class _MapsState extends State<Maps>
   // ============================
   // Waze-like route styling (Google Maps)
   // ============================
+
+  /// Target point for the current navigation phase.
+  /// - Before trip start: pickup
+  /// - After trip start: drop
+  LatLng? _routePhaseTarget() {
+    try {
+      if (driverReq.isEmpty) return null;
+      if (driverReq['accepted_at'] == null) return null;
+
+      final bool tripStarted = _tripStartValue() == 1;
+      final lat = _asDouble(tripStarted ? driverReq['drop_lat'] : driverReq['pick_lat']);
+      final lng = _asDouble(tripStarted ? driverReq['drop_lng'] : driverReq['pick_lng']);
+      if (lat == null || lng == null) return null;
+      return LatLng(lat, lng);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  double _routeMeters(List<LatLng> pts) {
+    if (pts.length < 2) return 0.0;
+    double sum = 0.0;
+    for (int i = 1; i < pts.length; i++) {
+      final a = pts[i - 1];
+      final b = pts[i];
+      sum += geolocator.Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+    }
+    return sum;
+  }
+
+  double _median(List<double> xs) {
+    if (xs.isEmpty) return 0.0;
+    xs.sort();
+    final mid = xs.length ~/ 2;
+    if (xs.length.isOdd) return xs[mid];
+    return (xs[mid - 1] + xs[mid]) / 2.0;
+  }
+
+  /// Removes the classic "go + return straight" artifact when the points list
+  /// contains two disjoint segments (Google draws a straight line between them).
+  /// We split by big jumps and keep the best segment (usually the real route).
+  List<LatLng> _cleanRoutePoints(List<LatLng> input) {
+    if (input.length < 2) return input;
+
+    // 1) Remove consecutive duplicates / jitter.
+    final List<LatLng> pts = <LatLng>[];
+    pts.add(input.first);
+    for (int i = 1; i < input.length; i++) {
+      final prev = pts.last;
+      final cur = input[i];
+      final d = geolocator.Geolocator.distanceBetween(
+        prev.latitude,
+        prev.longitude,
+        cur.latitude,
+        cur.longitude,
+      );
+      if (d >= 0.8) {
+        pts.add(cur);
+      }
+    }
+    if (pts.length < 2) return pts;
+
+    // 2) Estimate a jump threshold from typical segment distances.
+    final List<double> steps = <double>[];
+    for (int i = 1; i < pts.length; i++) {
+      final a = pts[i - 1];
+      final b = pts[i];
+      final d = geolocator.Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+      // Normal polyline steps are usually small; ignore huge steps for median.
+      if (d > 0.1 && d < 200) steps.add(d);
+    }
+    final med = steps.isNotEmpty ? _median(steps) : 18.0;
+    final jumpThresh = (med * 12.0).clamp(250.0, 2500.0);
+
+    // 3) Split into segments on large jumps.
+    final List<List<LatLng>> segments = <List<LatLng>>[];
+    List<LatLng> curSeg = <LatLng>[pts.first];
+    for (int i = 1; i < pts.length; i++) {
+      final a = pts[i - 1];
+      final b = pts[i];
+      final d = geolocator.Geolocator.distanceBetween(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+      if (d > jumpThresh) {
+        if (curSeg.length >= 2) segments.add(curSeg);
+        curSeg = <LatLng>[b];
+      } else {
+        curSeg.add(b);
+      }
+    }
+    if (curSeg.length >= 2) segments.add(curSeg);
+    if (segments.isEmpty) return pts;
+    if (segments.length == 1) return segments.first;
+
+    // 4) Pick the best segment.
+    final target = _routePhaseTarget();
+    double bestScore = -1e18;
+    List<LatLng> best = segments.first;
+    for (final seg in segments) {
+      final len = _routeMeters(seg);
+      double score = len;
+      if (target != null) {
+        final end = seg.last;
+        final endDist = geolocator.Geolocator.distanceBetween(
+          end.latitude,
+          end.longitude,
+          target.latitude,
+          target.longitude,
+        );
+        // Strongly prefer segments that actually end near the target.
+        if (endDist < 250) {
+          score += 20000;
+        }
+        score -= endDist * 3.0;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = seg;
+      }
+    }
+    return best;
+  }
   void _applyWazePolylineStyle() {
     try {
       if (mapType != 'google') return;
       if (polyList.isEmpty) return;
 
-      // Replace the route polyline with a thick "double stroke" (border + main line)
-      polyline.clear();
+      final cleanedPoints = _cleanRoutePoints(polyList);
+      if (cleanedPoints.length < 2) return;
+      // Replace ONLY the route polyline (do not clear the whole set -> avoids flicker and "double line").
+      polyline.removeWhere((p) =>
+      p.polylineId.value == 'route' ||
+          p.polylineId.value == 'route_main' ||
+          p.polylineId.value == 'route_border');
 
       polyline.add(
         Polyline(
-          polylineId: const PolylineId('route_border'),
-          points: polyList,
-          color: const Color(0xFF6A1B9A).withOpacity(0.25),
-          width: 14,
+          polylineId: const PolylineId('route'),
+          points: cleanedPoints,
+          color: const Color(0xFF1E88E5),
+          width: 7,
           startCap: Cap.roundCap,
           endCap: Cap.roundCap,
           jointType: JointType.round,
@@ -798,22 +1414,67 @@ class _MapsState extends State<Maps>
           zIndex: 0,
         ),
       );
-
-      polyline.add(
-        Polyline(
-          polylineId: const PolylineId('route_main'),
-          points: polyList,
-          color: const Color(0xFF6A1B9A),
-          width: 9,
-          startCap: Cap.roundCap,
-          endCap: Cap.roundCap,
-          jointType: JointType.round,
-          geodesic: true,
-          zIndex: 1,
-        ),
-      );
     } catch (_) {}
   }
+
+  int _polylineSignature(List<LatLng> pts) {
+    if (pts.length < 2) return pts.length;
+    int h = pts.length;
+    // Quantize to avoid tiny float noise changing the hash too often.
+    int q(double x) => (x * 1e5).round();
+    final a = pts.first;
+    final b = pts.last;
+    h = 31 * h + q(a.latitude);
+    h = 31 * h + q(a.longitude);
+    h = 31 * h + q(b.latitude);
+    h = 31 * h + q(b.longitude);
+    if (pts.length > 6) {
+      final m = pts[pts.length ~/ 2];
+      h = 31 * h + q(m.latitude);
+      h = 31 * h + q(m.longitude);
+    }
+    return h & 0x7fffffff;
+  }
+
+  /// Throttled repaint for Google route polyline (prevents UI jank).
+  void _applyWazePolylineStyleThrottled({bool force = false}) {
+    try {
+      if (mapType != 'google') return;
+      if (polyList.length < 2) return;
+
+      final now = DateTime.now();
+      final sig = _polylineSignature(polyList);
+      final lastAt = _lastPolylinePaintAt;
+      final elapsedMs = (lastAt == null) ? 1e9 : now.difference(lastAt).inMilliseconds.toDouble();
+
+      // If nothing meaningful changed recently, skip.
+      if (!force && sig == _lastPolylinePaintSig && elapsedMs < 1500) {
+        return;
+      }
+
+      // Enforce a minimum interval between repaint operations.
+      if (!force && lastAt != null) {
+        final minMs = _polylinePaintMinInterval.inMilliseconds;
+        if (elapsedMs < minMs) {
+          _polylinePaintTimer?.cancel();
+          final delay = Duration(milliseconds: (minMs - elapsedMs).ceil());
+          _polylinePaintTimer = Timer(delay, () {
+            if (!mounted) return;
+            _applyWazePolylineStyleThrottled(force: true);
+          });
+          return;
+        }
+      }
+
+      _polylinePaintTimer?.cancel();
+      _lastPolylinePaintAt = now;
+      _lastPolylinePaintSig = sig;
+
+      _applyWazePolylineStyle();
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
 
   int _tripStartValue() {
     if (driverReq.isEmpty) return 0;
@@ -886,6 +1547,7 @@ class _MapsState extends State<Maps>
 
     final z = zoom ?? _currentZoom ?? 16;
     try {
+      _markProgrammaticCameraMove();
       await _controller!.animateCamera(
         CameraUpdate.newCameraPosition(
           CameraPosition(
@@ -899,7 +1561,7 @@ class _MapsState extends State<Maps>
 
   /// If the driver goes off-route by [offRouteMeters], rebuild the route polyline from the current position.
   /// This is throttled to avoid hammering the Directions API.
-  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 50}) async {
+  Future<void> handleRouteDeviationAndSnap({double offRouteMeters = 70}) async {
     if (driverReq.isEmpty) return;
     if (polyList.isEmpty) return;
     if (_routeRebuildInProgress) return;
@@ -923,13 +1585,21 @@ class _MapsState extends State<Maps>
       if (minD <= offRouteMeters) break;
     }
 
-    if (minD <= offRouteMeters) return;
+    if (minD <= offRouteMeters) {
+      _offRouteConsecutive = 0;
+      return;
+    }
+
+    _offRouteConsecutive += 1;
+    if (_offRouteConsecutive < 2) {
+      return;
+    }
 
     final now = DateTime.now();
     if (_lastRouteRebuildAt != null) {
       final seconds = now.difference(_lastRouteRebuildAt!).inSeconds;
       // Cooldown: avoid rebuilding too often (cost + lag).
-      if (seconds < 8 && minD < offRouteMeters * 3) {
+      if (seconds < 12 && minD < offRouteMeters * 3) {
         return;
       }
     }
@@ -938,11 +1608,12 @@ class _MapsState extends State<Maps>
     _lastRouteRebuildAt = now;
     try {
       await rebuildRoutePolylinesFromCurrent();
-      syncGooglePolylineFromPolyList();
+      _applyWazePolylineStyleThrottled(force: true);
     } catch (_) {
       // If rebuild fails, keep the current polyline.
     } finally {
       _routeRebuildInProgress = false;
+      _offRouteConsecutive = 0;
     }
   }
 
@@ -950,30 +1621,37 @@ class _MapsState extends State<Maps>
   void _stopLiveDriverTracking() {
     _livePosSub?.cancel();
     _livePosSub = null;
+    _stopUiSmoothingTicker();
   }
 
   void _updateDriverMarker(LatLng latLng, double newHeading) {
     try {
-      myMarkers.removeWhere((m) => m.markerId.value == '1');
-
       final icon = (userDetails['vehicle_type_icon_for'] == 'motor_bike')
           ? pinLocationIcon3
           : (userDetails['vehicle_type_icon_for'] == 'taxi')
           ? pinLocationIcon2
           : pinLocationIcon;
 
-      myMarkers.add(
-        Marker(
-          markerId: const MarkerId('1'),
-          position: latLng,
-          icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
-              ? _driverGoogleArrowIcon!
-              : icon,
-          rotation: _vehicleRotationDeg(newHeading),
-          flat: true,
-          anchor: const Offset(0.5, 0.5),
-        ),
+      final marker = Marker(
+        markerId: const MarkerId('1'),
+        position: latLng,
+        icon: (mapType == 'google' &&
+            userDetails['role'] == 'driver')
+            ? ((_followDriver && _driverGoogleArrowIcon != null)
+            ? _driverGoogleArrowIcon!
+            : BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure))
+            : icon,
+        rotation: _vehicleRotationDeg(newHeading),
+        flat: true,
+        anchor: const Offset(0.5, 0.5),
       );
+
+      final index = myMarkers.indexWhere((m) => m.markerId.value == '1');
+      if (index >= 0) {
+        myMarkers[index] = marker;
+      } else {
+        myMarkers.add(marker);
+      }
     } catch (_) {}
   }
 
@@ -982,8 +1660,21 @@ class _MapsState extends State<Maps>
 
     final now = DateTime.now();
     if (_lastCameraMove != null &&
-        now.difference(_lastCameraMove!).inMilliseconds < 250) {
+        now.difference(_lastCameraMove!).inMilliseconds < 140) {
       return; // throttle camera work
+    }
+    if (_lastCameraTarget != null) {
+      final moved = geolocator.Geolocator.distanceBetween(
+        _lastCameraTarget!.latitude,
+        _lastCameraTarget!.longitude,
+        latLng.latitude,
+        latLng.longitude,
+      );
+      final headingDelta =
+      _shortestAngleDelta(_cameraBearing, _wrap360(newHeading)).abs();
+      if (moved < _cameraMinMoveMeters && headingDelta < _cameraMinHeadingDelta) {
+        return;
+      }
     }
     _lastCameraMove = now;
 
@@ -994,22 +1685,20 @@ class _MapsState extends State<Maps>
     bool useMoveCamera = false;
 
     if (_followBearing) {
-      // Smooth + avoid crazy spins near 0/360 and on sharp turns.
-      final delta = _shortestAngleDelta(_cameraBearing, desiredBearing);
+      _camBearingDeg = _smoothAngle(_camBearingDeg, desiredBearing, 0.55);
+      final delta = _shortestAngleDelta(_cameraBearing, _camBearingDeg);
 
-      // Small noise -> ignore.
       if (delta.abs() < 2.0) {
         bearingToApply = _wrap360(_cameraBearing);
       } else if (delta.abs() <= 45.0) {
-        // Smooth small rotations (Uber-like).
-        bearingToApply = _wrap360(_cameraBearing + (delta * 0.35));
+        bearingToApply = _smoothAngle(_cameraBearing, _camBearingDeg, 0.60);
       } else {
-        // Big turns: snap (prevents long wrong spins).
-        bearingToApply = desiredBearing;
+        bearingToApply = _camBearingDeg;
         useMoveCamera = true;
       }
     } else {
       _cameraBearing = 0.0;
+      _camBearingDeg = 0.0;
     }
 
     final cam = CameraPosition(
@@ -1018,13 +1707,24 @@ class _MapsState extends State<Maps>
       bearing: bearingToApply,
     );
 
-    if (useMoveCamera) {
-      _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+    if (mapType == 'google') {
+      if (useMoveCamera || (_lastFixSpeed > 0.7)) {
+        _markProgrammaticCameraMove();
+
+        _controller!.moveCamera(CameraUpdate.newCameraPosition(cam));
+      } else {
+        _markProgrammaticCameraMove();
+
+        _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
+      }
     } else {
-      _controller!.animateCamera(CameraUpdate.newCameraPosition(cam));
+      try {
+        _fmController.rotate(bearingToApply);
+      } catch (_) {}
     }
 
     _cameraBearing = bearingToApply;
+    _lastCameraTarget = latLng;
   }
 
   double _bearingBetween(LatLng a, LatLng b) {
@@ -1044,19 +1744,113 @@ class _MapsState extends State<Maps>
   }
 
   double _wrap360(double deg) {
-    final v = deg % 360.0;
-    return (v < 0) ? (v + 360.0) : v;
+    return ((deg % 360.0) + 360.0) % 360.0;
+  }
+
+  LatLng _projectLatLng(LatLng start, double bearingDeg, double distanceMeters) {
+    const earthRadius = 6371000.0;
+    final bearing = bearingDeg * math.pi / 180.0;
+    final lat1 = start.latitude * math.pi / 180.0;
+    final lon1 = start.longitude * math.pi / 180.0;
+    final dr = distanceMeters / earthRadius;
+
+    final lat2 = math.asin(math.sin(lat1) * math.cos(dr) +
+        math.cos(lat1) * math.sin(dr) * math.cos(bearing));
+    final lon2 = lon1 +
+        math.atan2(
+          math.sin(bearing) * math.sin(dr) * math.cos(lat1),
+          math.cos(dr) - math.sin(lat1) * math.sin(lat2),
+        );
+
+    return LatLng(lat2 * 180.0 / math.pi, lon2 * 180.0 / math.pi);
+  }
+
+  _SnapResult? _snapToPolyline(LatLng raw, List<LatLng> polylinePoints) {
+    if (polylinePoints.length < 2) return null;
+
+    final earthRadius = 6371000.0;
+
+    double minDist = double.infinity;
+    LatLng? bestPoint;
+    double bestHeading = heading;
+
+    for (var i = 0; i < polylinePoints.length - 1; i++) {
+      final a = polylinePoints[i];
+      final b = polylinePoints[i + 1];
+      final refLat = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
+
+      final ax = a.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final ay = a.latitude * math.pi / 180.0 * earthRadius;
+      final bx = b.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final by = b.latitude * math.pi / 180.0 * earthRadius;
+      final px = raw.longitude * math.pi / 180.0 * earthRadius * math.cos(refLat);
+      final py = raw.latitude * math.pi / 180.0 * earthRadius;
+
+      final abx = bx - ax;
+      final aby = by - ay;
+      final apx = px - ax;
+      final apy = py - ay;
+      final abLen2 = (abx * abx) + (aby * aby);
+      if (abLen2 == 0) continue;
+
+      var t = (apx * abx + apy * aby) / abLen2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
+
+      final projx = ax + abx * t;
+      final projy = ay + aby * t;
+
+      final dx = px - projx;
+      final dy = py - projy;
+      final dist = math.sqrt(dx * dx + dy * dy);
+
+      if (dist < minDist) {
+        minDist = dist;
+        final snapLat = (projy / earthRadius) * 180.0 / math.pi;
+        final snapLng =
+            (projx / (earthRadius * math.cos(refLat))) * 180.0 / math.pi;
+        bestPoint = LatLng(snapLat, snapLng);
+        bestHeading = _bearingBetween(a, b);
+      }
+    }
+
+    if (bestPoint == null) return null;
+    return _SnapResult(position: bestPoint, heading: _wrap360(bestHeading));
+  }
+
+  double _shortestAngleDelta(double from, double to) {
+    return ((to - from + 540.0) % 360.0) - 180.0;
+  }
+
+  double _smoothAngle(double current, double target, double alpha) {
+    final delta = _shortestAngleDelta(current, target);
+    return _wrap360(current + (delta * alpha));
+  }
+
+  double _resolveHeadingTarget({
+    required LatLng rawLatLng,
+    required double fallbackHeading,
+    double? snapHeading,
+  }) {
+    if (snapHeading != null) {
+      return _wrap360(snapHeading);
+    }
+    if (_lastSnappedLatLng != null) {
+      final moved = geolocator.Geolocator.distanceBetween(
+        _lastSnappedLatLng!.latitude,
+        _lastSnappedLatLng!.longitude,
+        rawLatLng.latitude,
+        rawLatLng.longitude,
+      );
+      if (moved >= 2.0) {
+        return _wrap360(_bearingBetween(_lastSnappedLatLng!, rawLatLng));
+      }
+    }
+    return _wrap360(fallbackHeading);
   }
 
   /// Signed shortest delta from [from] to [to] in degrees (-180..180).
-  double _shortestAngleDelta(double from, double to) {
-    final a = _wrap360(from);
-    final b = _wrap360(to);
-    var d = b - a;
-    if (d > 180.0) d -= 360.0;
-    if (d < -180.0) d += 360.0;
-    return d;
-  }
+  // (implemented above with modulo math to avoid wrap bugs)
 
 
 
@@ -1065,6 +1859,7 @@ class _MapsState extends State<Maps>
   void dispose() {
     _setKeepScreenOn(false);
     _stopLiveDriverTracking();
+    _polylinePaintTimer?.cancel();
     if (_timer != null) {
       _timer.cancel();
     }
@@ -1366,7 +2161,7 @@ class _MapsState extends State<Maps>
     if (driverReq['drop_address'] != null || choosenRide.isNotEmpty) {
       // Rebuild route
       await Future.sync(() => getPolylines(false));
-      syncGooglePolylineFromPolyList();
+      _applyWazePolylineStyleThrottled(force: true);
 
       await addDropMarker();
     }
@@ -1492,7 +2287,8 @@ class _MapsState extends State<Maps>
               myMarkers = [
                 Marker(
                     markerId: const MarkerId('1'),
-                    rotation: _vehicleRotationDeg(heading),
+                    rotation: (mapType == 'google' && userDetails['role'] == 'driver') ? 0.0 : _vehicleRotationDeg(heading),
+                    flat: (mapType == 'google' && userDetails['role'] == 'driver') ? false : true,
                     position: center,
                     icon: (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
                         ? _driverGoogleArrowIcon!
@@ -1556,6 +2352,7 @@ class _MapsState extends State<Maps>
             northeast: LatLng(driverReq['drop_lat'], driverReq['drop_lng']));
       }
       CameraUpdate cameraUpdate = CameraUpdate.newLatLngBounds(bound, 100);
+      _markProgrammaticCameraMove();
       _controller?.animateCamera(cameraUpdate);
     } else if (driverReq.isNotEmpty) {
       if (center.latitude > driverReq['pick_lat'] &&
@@ -1577,6 +2374,7 @@ class _MapsState extends State<Maps>
             northeast: LatLng(driverReq['pick_lat'], driverReq['pick_lng']));
       }
       CameraUpdate cameraUpdate = CameraUpdate.newLatLngBounds(bound, 100);
+      _markProgrammaticCameraMove();
       _controller?.animateCamera(cameraUpdate);
     }
   }
@@ -1654,28 +2452,25 @@ class _MapsState extends State<Maps>
 
     var media = MediaQuery.of(context).size;
 
-    // Bottom sheet (on-ride) sizing:
-    // - _panelCollapsed: cuánto se esconde cuando está "abajo"
-    // - _panelPeekHeight: cuánto queda visible cuando está "abajo" (bajalo para que se vea menos y el mapa se vea más)
-    final double _panelHeight = media.height * 1.2;
-    final double _panelPeekHeight = media.height * 0.10;
+    // Inset real de la barra de navegación del sistema (Samsung/Android).
+    // Usamos viewPadding para contemplar botones/gestos y evitar que el UI quede debajo.
+    final window = WidgetsBinding.instance.window;
+    final double _sysBottom = window.viewPadding.bottom / window.devicePixelRatio;
+    final double _safeHeight = (media.height - _sysBottom).clamp(0.0, media.height);
+
+    // Bottom sheet (on-ride) sizing (medido sobre el alto útil, sin la barra de navegación):
+    final double _panelHeight = _safeHeight * 1.2;
+    final double _panelPeekHeight = _safeHeight * 0.10;
     final double _panelCollapsed = _panelHeight - _panelPeekHeight;
 
-    // Límite de apertura para que el panel NO tape toda la pantalla:
-    // - Con viaje iniciado abrimos más (como tu imagen 3A).
-    // - Esperando al cliente abrimos menos (como tu imagen 4A).
-    final bool _tripStarted = (driverReq.isNotEmpty &&
-        (driverReq['is_trip_start'] == 1 || driverReq['is_trip_start'] == true));
-
-    final double _panelMaxOpenVisible =
-    _tripStarted ? (media.height * 0.72) : (media.height * 0.42);
+    // Maxi pidió que TODOS los paneles (esperando/en camino/llegar al destino/finalizar)
+    // suban más de la mitad para ver Origen/Destino/Precio sin arrastrar.
+    final double _panelMaxOpenVisible = _safeHeight * 0.82;
 
     // "hidden" mínimo (más chico = más abierto) para que visible nunca supere _panelMaxOpenVisible.
-    final double _panelOpenHidden =
-    (_panelHeight - _panelMaxOpenVisible).clamp(0.0, _panelCollapsed);
+    final double _panelOpenHidden = (_panelHeight - _panelMaxOpenVisible).clamp(0.0, _panelCollapsed);
 
-    final double _panelHidden =
-    (addressBottom ?? _panelCollapsed).clamp(_panelOpenHidden, _panelCollapsed);
+    final double _panelHidden = (addressBottom ?? _panelCollapsed).clamp(_panelOpenHidden, _panelCollapsed);
     final double _panelVisible = _panelHeight - _panelHidden;
 
     return PopScope(
@@ -1698,6 +2493,9 @@ class _MapsState extends State<Maps>
 
               // If a trip/request gets rejected/cancelled, ensure we clear the route and re-center on the driver.
               if (driverReq.isEmpty) {
+                // Reset bottom-sheet auto-open for the next trip
+                _bippAutoOpenOnRidePanel = false;
+                addressBottom = null;
                 if (!_pendingCenterAfterClear) {
                   _pendingCenterAfterClear = true;
                   WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -1708,6 +2506,17 @@ class _MapsState extends State<Maps>
                 }
               } else {
                 _pendingCenterAfterClear = false;
+              }
+
+              // Auto-open the on-ride bottom sheet once when a ride is accepted so the driver can see all info.
+              if (driverReq.isNotEmpty && driverReq['accepted_at'] != null && !_bippAutoOpenOnRidePanel) {
+                _bippAutoOpenOnRidePanel = true;
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted) return;
+                  setState(() {
+                    addressBottom = _panelOpenHidden;
+                  });
+                });
               }
 
               if (_isDarkTheme != isDarkTheme && _controller != null) {
@@ -1825,58 +2634,11 @@ class _MapsState extends State<Maps>
 
                       vsync: this, //From the widget
                     );
-                    if (mapType == 'google') {
-                      List polys = [];
-                      dynamic nearestLat;
-                      dynamic pol;
-                      for (var e in polyList) {
-                        var dist = calculateDistance(center.latitude,
-                            center.longitude, e.latitude, e.longitude);
-                        if (pol == null) {
-                          polys.add(dist);
-                          pol = dist;
-                          nearestLat = e;
-                        } else {
-                          if (dist < pol) {
-                            polys.add(dist);
-                            pol = dist;
-                            nearestLat = e;
-                          }
-                        }
-                      }
-                      int currentNumber = polyList
-                          .indexWhere((element) => element == nearestLat);
-                      for (var i = 0; i < currentNumber; i++) {
-                        polyList.removeAt(0);
-                      }
-                      polyline.clear();
-                      fmpoly.clear();
-                      syncGooglePolylineFromPolyList();
-                    } else {
-                      List polys = [];
-                      dynamic nearestLat;
-                      dynamic pol;
-                      for (var e in fmpoly) {
-                        var dist = calculateDistance(center.latitude,
-                            center.longitude, e.latitude, e.longitude);
-                        if (pol == null) {
-                          polys.add(dist);
-                          pol = dist;
-                          nearestLat = e;
-                        } else {
-                          if (dist < pol) {
-                            polys.add(dist);
-                            pol = dist;
-                            nearestLat = e;
-                          }
-                        }
-                      }
-                      int currentNumber =
-                      fmpoly.indexWhere((element) => element == nearestLat);
-                      for (var i = 0; i < currentNumber; i++) {
-                        fmpoly.removeAt(0);
-                      }
-                    }
+                    // FIX POLYLINE (estabilidad + rendimiento):
+                    // Antes: se recortaba polyList (removeRange) + se hacía polyline.clear() en cada tick.
+                    // Eso hacía que la ruta titile, se vea doble, aparezcan líneas raras y se ponga pesado.
+                    // Ahora: NO se recorta la polyline acá, ni se limpian polylines.
+                    // El reroute se maneja por el detector de desvío (_handleRouteDeviationAndSnap).
                     animateCar(
                         myMarkers
                             .firstWhere((element) =>
@@ -1911,7 +2673,8 @@ class _MapsState extends State<Maps>
                     userDetails['role'] != 'owner') {
                   myMarkers.add(Marker(
                       markerId: const MarkerId('1'),
-                      rotation: _vehicleRotationDeg(heading),
+                      rotation: (mapType == 'google' && userDetails['role'] == 'driver') ? 0.0 : _vehicleRotationDeg(heading),
+                      flat: (mapType == 'google' && userDetails['role'] == 'driver') ? false : true,
                       position: center,
                       icon:
                       (mapType == 'google' && userDetails['role'] == 'driver' && _driverGoogleArrowIcon != null)
@@ -3045,6 +3808,10 @@ class _MapsState extends State<Maps>
                                             media.height * 1,
                                             width:
                                             media.width * 1,
+                                            // Fondo para que el área bajo la barra del sistema no quede blanca
+                                            color: const Color(0xFF001D1D),
+                                            // Reservamos el alto de la barra de navegación Android (Samsung)
+                                            padding: EdgeInsets.only(bottom: _sysBottom),
                                             //google maps
                                             child: (mapType ==
                                                 'google')
@@ -3074,12 +3841,26 @@ class _MapsState extends State<Maps>
                                                   },
                                                   padding: EdgeInsets.only(
                                                     bottom: (driverReq['accepted_at'] != null)
-                                                        ? (_panelVisible + MediaQuery.of(context).padding.bottom + 8)
+                                                        ? (_panelVisible + _sysBottom + 8)
                                                         : (media.width * 1),
                                                     top: _bippTopPadding,
                                                   ),
                                                   onMapCreated:
                                                   _onMapCreated,
+                                                  onCameraMoveStarted: () {
+                                                    final createdAt = _mapCreatedAt;
+                                                    if (createdAt != null &&
+                                                        DateTime.now().difference(createdAt).inMilliseconds < 1500) {
+                                                      return;
+                                                    }
+                                                    _bippOnUserCameraMoveStarted();
+                                                  },
+                                                  onCameraMove: (pos) {
+                                                    _bippOnUserCameraMove(pos);
+                                                  },
+                                                  onCameraIdle: () {
+                                                    _bippOnUserCameraIdle();
+                                                  },
                                                   initialCameraPosition:
                                                   CameraPosition(
                                                     target: (center ==
@@ -3094,6 +3875,7 @@ class _MapsState extends State<Maps>
                                                       myMarkers),
                                                   polylines:
                                                   polyline,
+                                                  polygons: _showUnsafeZones ? _unsafeZonePolygons : <Polygon>{},
                                                   minMaxZoomPreference:
                                                   const MinMaxZoomPreference(
                                                       0.0,
@@ -3894,7 +4676,7 @@ class _MapsState extends State<Maps>
 
                                           //request popup accept or reject
                                           Positioned(
-                                              bottom: driverReq.isEmpty ? media.width * 0.20 : 0,
+                                              bottom: (driverReq.isEmpty ? media.width * 0.20 : 0) + _sysBottom,
                                               child: Column(
                                                 crossAxisAlignment:
                                                 CrossAxisAlignment
@@ -4056,8 +4838,7 @@ class _MapsState extends State<Maps>
                                                           onTap: () async {
                                                             if (locationAllowed == true) {
                                                               if (mapType == 'google') {
-                                                                _followDriver = true;
-                                                                _controller?.animateCamera(CameraUpdate.newCameraPosition(CameraPosition(target: center, zoom: _currentZoom, bearing: heading)));
+                                                                _bippResumeFollowNow();
                                                               } else {
                                                                 _fmController.move(fmlt.LatLng(center.latitude, center.longitude), 14);
                                                               }
@@ -4205,7 +4986,43 @@ class _MapsState extends State<Maps>
                                                                       ],
                                                                     ),
                                                                     SizedBox(
-                                                                      height: media.width * 0.025,
+                                                                      height: media.width * 0.015,
+                                                                    ),
+                                                                    // BIP: Seguridad de origen/destino (Zonas no seguras)
+                                                                    Builder(builder: (context) {
+                                                                      final pickLat = _asDouble(choosenRide[0]['pick_lat']);
+                                                                      final pickLng = _asDouble(choosenRide[0]['pick_lng']);
+                                                                      final dropLat = _asDouble(choosenRide[choosenRide.length - 1]['drop_lat']);
+                                                                      final dropLng = _asDouble(choosenRide[choosenRide.length - 1]['drop_lng']);
+
+                                                                      final pick = (pickLat != null && pickLng != null) ? LatLng(pickLat, pickLng) : null;
+                                                                      final drop = (dropLat != null && dropLng != null) ? LatLng(dropLat, dropLng) : null;
+
+                                                                      final pickUnsafe = _safetyResultFor(pick);
+                                                                      final dropUnsafe = _safetyResultFor(drop);
+
+                                                                      return Row(
+                                                                        children: [
+                                                                          Expanded(
+                                                                            child: _bippSafetyPill(
+                                                                              label: 'Origen',
+                                                                              unsafe: pickUnsafe,
+                                                                              fontSize: media.width * 0.030,
+                                                                            ),
+                                                                          ),
+                                                                          const SizedBox(width: 10),
+                                                                          Expanded(
+                                                                            child: _bippSafetyPill(
+                                                                              label: 'Destino',
+                                                                              unsafe: dropUnsafe,
+                                                                              fontSize: media.width * 0.030,
+                                                                            ),
+                                                                          ),
+                                                                        ],
+                                                                      );
+                                                                    }),
+                                                                    SizedBox(
+                                                                      height: media.width * 0.020,
                                                                     ),
                                                                     (choosenRide[0]['is_luggage_available'] == true || choosenRide[0]['is_pet_available'] == true)
                                                                         ? Column(
@@ -4371,7 +5188,7 @@ class _MapsState extends State<Maps>
                                                                                   setState(() {
                                                                                     isAvailable = false;
                                                                                   });
-                                                                                  FirebaseDatabase.instance.ref().child('drivers/driver_${userDetails['id']}').update({'is_available': false});
+                                                                                  FirebaseDatabase.instance.ref().child('drivers/driver_${userDetails['id']}').update({'is_available': 0, 'updated_at': ServerValue.timestamp});
                                                                                   Navigator.pushAndRemoveUntil(context, MaterialPageRoute(builder: (context) => const RidePage()), (route) => false);
                                                                                   // Navigator.pop(context);
                                                                                 } catch (e) {
@@ -4464,7 +5281,7 @@ class _MapsState extends State<Maps>
                                                                   children: [
                                                                     Container(
                                                                       width: media.width * 0.9,
-                                                                      height: media.width * 0.3,
+                                                                      height: media.width * 0.34,
                                                                       padding: EdgeInsets.all(media.width * 0.02),
                                                                       // color: Colors.yellow,
                                                                       child: Row(
@@ -4514,6 +5331,24 @@ class _MapsState extends State<Maps>
                                                                                       ),
                                                                                     ],
                                                                                   ),
+                                                                                  SizedBox(height: media.width * 0.005),
+                                                                                  Builder(builder: (context) {
+                                                                                    final info = _bippPickupToDropInfo();
+                                                                                    if (info == null) return const SizedBox.shrink();
+                                                                                    return Padding(
+                                                                                      padding: EdgeInsets.only(top: media.width * 0.005),
+                                                                                      child: Text(
+                                                                                        "${info['km']} km | ${info['mins']} ${languages[choosenLanguage]['text_mins']}",
+                                                                                        maxLines: 1,
+                                                                                        overflow: TextOverflow.ellipsis,
+                                                                                        style: TextStyle(
+                                                                                          color: Colors.white.withOpacity(0.9),
+                                                                                          fontSize: media.width * twelve,
+                                                                                          fontWeight: ui.FontWeight.w600,
+                                                                                        ),
+                                                                                      ),
+                                                                                    );
+                                                                                  }),
                                                                                   (driverReq['drop_address'] == null && driverReq['is_rental'] == false)
                                                                                       ? Container()
                                                                                       : Container(
@@ -4759,6 +5594,42 @@ class _MapsState extends State<Maps>
                                                                         ),
                                                                       ),
                                                                     ),
+                                                                    // BIP: Seguridad de origen/destino (Zonas no seguras) - driverReq
+                                                                    Builder(builder: (context) {
+                                                                      final pickLat = _asDouble(driverReq['pick_lat']);
+                                                                      final pickLng = _asDouble(driverReq['pick_lng']);
+                                                                      final dropLat = _asDouble(driverReq['drop_lat']);
+                                                                      final dropLng = _asDouble(driverReq['drop_lng']);
+
+                                                                      final pick = (pickLat != null && pickLng != null) ? LatLng(pickLat, pickLng) : null;
+                                                                      final drop = (dropLat != null && dropLng != null) ? LatLng(dropLat, dropLng) : null;
+
+                                                                      final pickUnsafe = _safetyResultFor(pick);
+                                                                      final dropUnsafe = _safetyResultFor(drop);
+
+                                                                      return Padding(
+                                                                        padding: EdgeInsets.only(bottom: media.width * 0.015),
+                                                                        child: Row(
+                                                                          children: [
+                                                                            Expanded(
+                                                                              child: _bippSafetyPill(
+                                                                                label: 'Origen',
+                                                                                unsafe: pickUnsafe,
+                                                                                fontSize: media.width * 0.030,
+                                                                              ),
+                                                                            ),
+                                                                            const SizedBox(width: 10),
+                                                                            Expanded(
+                                                                              child: _bippSafetyPill(
+                                                                                label: 'Destino',
+                                                                                unsafe: dropUnsafe,
+                                                                                fontSize: media.width * 0.030,
+                                                                              ),
+                                                                            ),
+                                                                          ],
+                                                                        ),
+                                                                      );
+                                                                    }),
                                                                     SizedBox(
                                                                       height: media.width * 0.02,
                                                                     ),
@@ -4902,7 +5773,7 @@ class _MapsState extends State<Maps>
                                               const Duration(
                                                   milliseconds:
                                                   250),
-                                              bottom: -_panelHidden,
+                                              bottom: -_panelHidden + _sysBottom,
                                               child:
                                               GestureDetector(
                                                 onVerticalDragStart:
@@ -4997,8 +5868,7 @@ class _MapsState extends State<Maps>
                                                       width:
                                                       media.width *
                                                           1,
-                                                      height: media.height *
-                                                          1.2,
+                                                      height: _panelHeight,
                                                       decoration: BoxDecoration(
                                                         borderRadius:
                                                         const BorderRadius.only(topLeft: Radius.circular(10), topRight: Radius.circular(10)),
@@ -5577,7 +6447,7 @@ class _MapsState extends State<Maps>
                                                           Expanded(
                                                             child: SingleChildScrollView(
                                                               controller: _cont,
-                                                              physics: (addressBottom != null && addressBottom <= (media.height * 0.25)) ? const BouncingScrollPhysics() : const NeverScrollableScrollPhysics(),
+                                                              physics: (addressBottom != null && addressBottom <= (_panelOpenHidden + (media.height * 0.02))) ? const BouncingScrollPhysics() : const NeverScrollableScrollPhysics(),
                                                               child: Column(
                                                                 children: [
                                                                   if (driverReq['transport_type'] == 'delivery')
@@ -7498,7 +8368,7 @@ class _MapsState extends State<Maps>
                                               BorderRadius.circular(12)),
                                           child: Column(children: [
                                             Container(
-                                              height: media.width * 0.18,
+                                              height: math.max(media.width * 0.18, 72),
                                               width: media.width * 0.18,
                                               decoration: const BoxDecoration(
                                                   shape: BoxShape.circle,
@@ -9089,6 +9959,8 @@ class _MapsState extends State<Maps>
     getBearing(LatLng(fromLat, fromLong), LatLng(toLat, toLong));
 
 
+
+    final bool _headingUpDriverMarker = (mapType == 'google' && markerid.toString() == '1' && userDetails['role'] == 'driver');
     // Force Google-style blue arrow for the driver's own marker (id '1')
     if (mapType == 'google' && markerid.toString() == '1' && userDetails['role'] == 'driver') {
       await _ensureDriverGoogleArrowIcon();
@@ -9105,8 +9977,8 @@ class _MapsState extends State<Maps>
           position: LatLng(fromLat, fromLong),
           icon: icon,
           anchor: const Offset(0.5, 0.5),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: _headingUpDriverMarker ? false : true,
+          rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
           draggable: false);
     } else {
       carMarker = Marker(
@@ -9115,8 +9987,8 @@ class _MapsState extends State<Maps>
           icon: icon,
           anchor: const Offset(0.5, 0.5),
           infoWindow: InfoWindow(title: number, snippet: name),
-          flat: true,
-          rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+          flat: _headingUpDriverMarker ? false : true,
+          rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
           draggable: false);
     }
 
@@ -9138,21 +10010,6 @@ class _MapsState extends State<Maps>
         double lat = v * toLat + (1 - v) * fromLat;
 
         LatLng newPos = LatLng(lat, lng);
-
-        // Seguir automáticamente al vehículo en Google Maps
-        if (mapType == 'google' && _controller != null) {
-          try {
-            _controller!.animateCamera(
-              CameraUpdate.newCameraPosition(
-                CameraPosition(
-                  target: newPos,
-                  zoom: 18.0,
-                ),
-              ),
-            );
-          } catch (_) {}
-        }
-
         //New marker location
 
         if (name == '' && number == '') {
@@ -9161,8 +10018,8 @@ class _MapsState extends State<Maps>
               position: newPos,
               icon: icon,
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: _headingUpDriverMarker ? false : true,
+              rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
               draggable: false);
         } else {
           carMarker = Marker(
@@ -9171,8 +10028,8 @@ class _MapsState extends State<Maps>
               icon: icon,
               infoWindow: InfoWindow(title: number, snippet: name),
               anchor: const Offset(0.5, 0.5),
-              flat: true,
-              rotation: _followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing),
+              flat: _headingUpDriverMarker ? false : true,
+              rotation: _headingUpDriverMarker ? 0.0 : (_followBearing ? ((bearing % 360) + 360) % 360 : _vehicleRotationDeg(bearing)),
               draggable: false);
         }
 
@@ -9194,6 +10051,8 @@ class _MapsState extends State<Maps>
               .firstWhere((element) => element.markerId == MarkerId(markerid))
               .position)) {
           } else {
+            _markProgrammaticCameraMove();
+
             _controller.animateCamera(CameraUpdate.newLatLng(center));
           }
         });
@@ -9548,13 +10407,13 @@ class _MapsState extends State<Maps>
     return Positioned(
       left: 14,
       right: 14,
-      bottom: 10,
+      bottom: 10 + (WidgetsBinding.instance.window.viewPadding.bottom / WidgetsBinding.instance.window.devicePixelRatio),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(26),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
           child: Container(
-            height: media.width * 0.18,
+            height: math.max(media.width * 0.18, 72),
             padding: const EdgeInsets.symmetric(horizontal: 10),
             decoration: BoxDecoration(
               color: Colors.black.withOpacity(0.26),
@@ -10280,6 +11139,13 @@ class _MapsState extends State<Maps>
 
 }
 
+class _SnapResult {
+  const _SnapResult({required this.position, required this.heading});
+
+  final LatLng position;
+  final double heading;
+}
+
 
 LinearGradient _bippGreenFadeGradient({bool strong = false, double opacity = 1.0}) {
   // Degradé VERDE pero 100% OPACO (sin transparencias) para que se lean las letras
@@ -10912,3 +11778,5 @@ class _EcgPulsePainter extends CustomPainter {
     return oldDelegate.progress != progress || oldDelegate.intensity != intensity;
   }
 }
+
+

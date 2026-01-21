@@ -80,8 +80,6 @@ String mapType = '';
 // ---------------------------------------------------------------------------
 // Realtime DB optimization caches (avoid pushing static fields every 5 seconds)
 // ---------------------------------------------------------------------------
-DateTime? _lastDriverMetaPushAt;
-String _lastDriverMetaHash = '';
 DateTime? _lastDriverStateCheckAt;
 
 // ---------------------------------------------------------------------------
@@ -91,14 +89,10 @@ const Duration kHttpTimeout = Duration(seconds: 15);
 const Duration kOsrmTimeout = Duration(seconds: 8);
 
 // ---------------------------------------------------------------------------
-// Realtime DB location throttling (reduce battery/data/cost)
+// Realtime DB driver location cadence (fixed 5s)
 // ---------------------------------------------------------------------------
-DateTime? _lastDriverLocPushAt;
-double? _lastDriverLocLat;
-double? _lastDriverLocLng;
-
-const Duration kFirebaseLocMinInterval = Duration(seconds: 10);
-const double kFirebaseLocMinMeters = 20.0;
+const Duration kFirebaseLocationTick = Duration(seconds: 5);
+Timer? _firebaseLocationTimer;
 
 // ---------------------------------------------------------------------------
 // Driver location polling (reduce wakeups)
@@ -1864,9 +1858,49 @@ driverStatus() async {
 
 currentPositionUpdate() async {
   geolocs.LocationPermission permission;
-  GeoHasher geo = GeoHasher();
 
   _positionUpdateTimer?.cancel();
+  _firebaseLocationTimer?.cancel();
+
+  _firebaseLocationTimer =
+      Timer.periodic(kFirebaseLocationTick, (timer) async {
+        if (userDetails.isEmpty || userDetails['role'] != 'driver') {
+          return;
+        }
+        if (center == null) return;
+
+        try {
+          final firebase = FirebaseDatabase.instance.ref();
+          final int isActive = (userDetails['active'] == true || userDetails['active'] == 1) ? 1 : 0;
+          final int baseAvail = (userDetails['available'] == true || userDetails['available'] == 1) ? 1 : 0;
+          final bool onTrip = (driverReq.isNotEmpty && driverReq['accepted_at'] != null && driverReq['is_completed'] == 0);
+          final int avail = (isActive == 1 && !onTrip) ? baseAvail : 0;
+
+          final geo = GeoHasher();
+          final g = geo.encode(center.longitude, center.latitude);
+
+          await firebase.child('drivers/driver_${userDetails['id']}').update({
+            'bearing': heading,
+            'lat': center.latitude,
+            'lng': center.longitude,
+            // GeoFire-style helpers
+            'l': [center.latitude, center.longitude],
+            'g': g,
+            // IMPORTANT: backend filtra por estos flags
+            'is_active': isActive,
+            'is_available': avail,
+            'ts': DateTime.now().millisecondsSinceEpoch,
+            'updated_at': ServerValue.timestamp,
+          });
+
+          // BIP: Sync de perfil ocasional (no en cada tick)
+          bippSyncDriverProfileToFirebase();
+        } catch (e) {
+          if (e is SocketException) {
+            internet = false;
+          }
+        }
+      });
 
   _positionUpdateTimer = Timer.periodic(kDriverPositionTick, (timer) async {
     final tickNow = DateTime.now();
@@ -1900,104 +1934,19 @@ currentPositionUpdate() async {
         if (positionStream == null || positionStream!.isPaused) {
           positionStreamData();
         }
-
-        final firebase = FirebaseDatabase.instance.ref();
-        // center = LatLng(11.0640986, 76.9984439);
-        try {
-          if (center == null) return;
-          final payload = <String, dynamic>{
-            'bearing': heading,
-            'date': tickNow.toIso8601String(),
-            'id': userDetails['id'],
-            'g': geo.encode(center.longitude, center.latitude),
-            'is_active': userDetails['active'] == true ? 1 : 0,
-            'is_available': userDetails['available'],
-            'l': {'0': center.latitude, '1': center.longitude},
-            'updated_at': ServerValue.timestamp,
-          };
-
-          // Push static/meta fields only when they change (or every 5 minutes as a safety refresh)
-          final metaHash =
-              '${userDetails['mobile']}|${userDetails['name']}|${userDetails['profile_picture']}|${userDetails['rating']}|${userDetails['vehicle_type_icon_for']}|${userDetails['car_number']}|${userDetails['car_make_name']}|${userDetails['vehicle_type_id']}|${userDetails['vehicle_types']}|${userDetails['owner_id']}|${userDetails['service_location_id']}|${userDetails['transport_type']}';
-
-          final shouldPushMeta = _lastDriverMetaHash != metaHash ||
-              _lastDriverMetaPushAt == null ||
-              tickNow.difference(_lastDriverMetaPushAt!) >
-                  const Duration(minutes: 5);
-
-          if (shouldPushMeta) {
-            payload.addAll({
-              'mobile': userDetails['mobile'],
-              'name': userDetails['name'],
-              'profile_picture': userDetails['profile_picture'],
-              'rating': userDetails['rating'],
-              'vehicle_type_icon': userDetails['vehicle_type_icon_for'],
-              'vehicle_number': userDetails['car_number'],
-              'vehicle_type_name': userDetails['car_make_name'],
-              'vehicle_type': userDetails['vehicle_type_id'],
-              'vehicle_types': userDetails['vehicle_types'],
-              'ownerid': userDetails['owner_id'],
-              'service_location_id': userDetails['service_location_id'],
-              'transport_type': userDetails['transport_type'],
-            });
-
-            _lastDriverMetaHash = metaHash;
-            _lastDriverMetaPushAt = tickNow;
-          }
-
-          final latNow = center.latitude;
-          final lngNow = center.longitude;
-
-          final bool movedEnough = (_lastDriverLocLat == null || _lastDriverLocLng == null)
-              ? true
-              : geolocs.Geolocator.distanceBetween(
-            _lastDriverLocLat!,
-            _lastDriverLocLng!,
-            latNow,
-            lngNow,
-          ) >= kFirebaseLocMinMeters;
-
-          final bool timeEnough = (_lastDriverLocPushAt == null)
-              ? true
-              : tickNow.difference(_lastDriverLocPushAt!) >= kFirebaseLocMinInterval;
-
-          final bool shouldWriteLoc = movedEnough || timeEnough;
-          final bool shouldWrite = shouldWriteLoc || shouldPushMeta;
-
-          if (shouldWrite) {
-            await firebase
-                .child('drivers/driver_${userDetails['id']}')
-                .update(payload);
-
-            _lastDriverLocPushAt = tickNow;
-            _lastDriverLocLat = latNow;
-            _lastDriverLocLng = lngNow;
-          }
-          if (driverReq.isNotEmpty) {
-            if (driverReq['accepted_at'] != null &&
-                driverReq['is_completed'] == 0) {
-              requestDetailsUpdate(
-                  double.parse(heading.toString()),
-                  double.parse(center.latitude.toString()),
-                  double.parse(center.longitude.toString()));
-
-              var distCalc = calculateDistance(
-                center.latitude,
-                center.longitude,
-                driverReq['drop_lat'],
-                driverReq['drop_lng'],
-              );
-              distTime = double.parse((distCalc / 1000).toString());
-            }
-          }
-
-          valueNotifierHome.incrementNotifier();
-        } catch (e) {
-          if (e is SocketException) {
-            internet = false;
-            valueNotifierHome.incrementNotifier();
-          }
+        if (center != null &&
+            driverReq.isNotEmpty &&
+            driverReq['accepted_at'] != null &&
+            driverReq['is_completed'] == 0) {
+          var distCalc = calculateDistance(
+            center.latitude,
+            center.longitude,
+            driverReq['drop_lat'],
+            driverReq['drop_lng'],
+          );
+          distTime = double.parse((distCalc / 1000).toString());
         }
+        valueNotifierHome.incrementNotifier();
       } else if (userDetails['active'] == false &&
           serviceEnabled == true &&
           permission != geolocs.LocationPermission.denied &&
@@ -2180,16 +2129,112 @@ userInactive() {
   final firebase = FirebaseDatabase.instance.ref();
   firebase.child('drivers/driver_${userDetails['id']}').update({
     'is_active': 0,
+    'is_available': 0,
+    'updated_at': ServerValue.timestamp,
   });
 }
 
+
+// ---------------- BIP: Sync de datos del conductor a Firebase (perfil/vehículo) ----------------
+
+int _bippLastProfileSyncMs = 0;
+
+/// Sincroniza datos "personales" y de vehículo del conductor hacia:
+/// drivers/driver_<id>
+/// Se ejecuta al conectarse (force) y luego cada pocos minutos (sin force),
+/// para que el pasajero vea nombre/vehículo y el backend pueda filtrar por vehicle_types.
+Future<void> bippSyncDriverProfileToFirebase({bool force = false}) async {
+  try {
+    if (userDetails.isEmpty || userDetails['id'] == null) return;
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!force && _bippLastProfileSyncMs != 0 && (now - _bippLastProfileSyncMs) < 5 * 60 * 1000) {
+      return;
+    }
+    _bippLastProfileSyncMs = now;
+
+    final firebase = FirebaseDatabase.instance.ref();
+    final Map<String, dynamic> data = {};
+
+    int _asIntBool(dynamic v) {
+      if (v == true) return 1;
+      if (v == false) return 0;
+      if (v is num) return v.toInt();
+      if (v is String) {
+        final s = v.trim().toLowerCase();
+        if (s == '1' || s == 'true') return 1;
+        if (s == '0' || s == 'false') return 0;
+      }
+      return 0;
+    }
+
+    void put(String k, dynamic v) {
+      if (v == null) return;
+      if (v is String && v.trim().isEmpty) return;
+      data[k] = v;
+    }
+
+    // Flags básicos del perfil
+    put('active', _asIntBool(userDetails['active']));
+    put('approve', _asIntBool(userDetails['approve']));
+
+    // Datos personales (si existen en userDetails)
+    put('id', userDetails['id']);
+    put('name', userDetails['name'] ?? userDetails['first_name'] ?? userDetails['full_name']);
+    put('mobile', userDetails['mobile'] ?? userDetails['phone']);
+    put('gender', userDetails['gender']);
+    put('profile_picture', userDetails['profile_picture'] ?? userDetails['profilePicture'] ?? userDetails['image']);
+    put('rating', userDetails['rating']);
+
+    // Datos de servicio/vehículo
+    put('service_location_id', userDetails['service_location_id']);
+    put('transport_type', userDetails['transport_type']);
+    put('vehicle_number', userDetails['vehicle_number']);
+    put('vehicle_type_icon', userDetails['vehicle_type_icon']);
+    put('vehicle_type_name', userDetails['vehicle_type_name']);
+
+    // vehicle_types: el backend lo usa para matchear el tipo
+    dynamic vt = userDetails['vehicle_types'] ?? userDetails['vehicleTypes'] ?? userDetails['vehicle_type_id'] ?? userDetails['type_id'];
+    if (vt != null) {
+      if (vt is List) {
+        data['vehicle_types'] = vt;
+      } else {
+        data['vehicle_types'] = [vt];
+      }
+    }
+
+    // Guardar (sin pisar ubicación/flags de presencia)
+    await firebase.child("drivers/driver_${userDetails['id']}").update(data);
+  } catch (_) {
+    // Nunca crashear por esto
+  }
+}
+
+// ---------------- END BIP: Sync perfil ----------------
+
+
 userActive() {
+  // BIP: al conectarse, empujar datos personales/vehículo a Firebase
+  bippSyncDriverProfileToFirebase(force: true);
+  if (center == null) return;
   final firebase = FirebaseDatabase.instance.ref();
+
+  final int baseAvail = (userDetails['available'] == true || userDetails['available'] == 1) ? 1 : 0;
+  final bool onTrip = (driverReq.isNotEmpty && driverReq['accepted_at'] != null && driverReq['is_completed'] == 0);
+  final int avail = (!onTrip) ? baseAvail : 0;
+
+  final geo = GeoHasher();
+  final g = geo.encode(center.longitude, center.latitude);
+
   firebase.child('drivers/driver_${userDetails['id']}').update({
     'is_active': 1,
-    'l': {'0': center.latitude, '1': center.longitude},
+    'is_available': avail,
+    'bearing': heading,
+    'lat': center.latitude,
+    'lng': center.longitude,
+    'l': [center.latitude, center.longitude],
+    'g': g,
     'updated_at': ServerValue.timestamp,
-    'is_available': userDetails['available'],
   });
 }
 
@@ -2241,7 +2286,7 @@ requestAccept() async {
           FirebaseDatabase.instance
               .ref()
               .child('drivers/driver_${userDetails['id']}')
-              .update({'is_available': false});
+              .update({'is_available': 0, 'updated_at': ServerValue.timestamp});
           duration = 0;
           requestStreamStart?.cancel();
           requestStreamStart = null;
@@ -3466,7 +3511,7 @@ userRating() async {
       FirebaseDatabase.instance
           .ref()
           .child('drivers/driver_${userDetails['id']}')
-          .update({'is_available': true});
+          .update({'is_available': 1, 'updated_at': ServerValue.timestamp});
       await getUserDetails();
       result = true;
     } else if (response.statusCode == 401) {
@@ -4456,6 +4501,8 @@ userLogout() async {
         final position = FirebaseDatabase.instance.ref();
         position.child('drivers/driver_$id').update({
           'is_active': 0,
+          'is_available': 0,
+          'updated_at': ServerValue.timestamp,
         });
       }
       rideStreamStart?.cancel();
@@ -5278,25 +5325,113 @@ adminmessageseen() async {
 //location stream
 bool positionStreamStarted = false;
 StreamSubscription<geolocs.Position>? positionStream;
+final StreamController<geolocs.Position> _positionStreamController =
+StreamController<geolocs.Position>.broadcast();
+Stream<geolocs.Position> get positionStreamUpdates =>
+    _positionStreamController.stream;
 
 geolocs.LocationSettings locationSettings = (platform == TargetPlatform.android)
     ? geolocs.AndroidSettings(
-    accuracy: geolocs.LocationAccuracy.high,
-    distanceFilter: 10,
-    intervalDuration: const Duration(seconds: 5),
-    foregroundNotificationConfig:
-    const geolocs.ForegroundNotificationConfig(
-      notificationText:
-      "Product Name will continue to receive your location in background",
-      notificationTitle: "Location background service running",
-      enableWakeLock: true,
-    ))
+  // Defaults agresivos para navegación (el modo exacto se ajusta con updateDriverLocationSettings).
+  accuracy: geolocs.LocationAccuracy.bestForNavigation,
+  distanceFilter: 2,
+  intervalDuration: const Duration(seconds: 1),
+  foregroundNotificationConfig: const geolocs.ForegroundNotificationConfig(
+    notificationText:
+    "Product Name will continue to receive your location in background",
+    notificationTitle: "Location background service running",
+    enableWakeLock: true,
+  ),
+)
     : geolocs.AppleSettings(
-  accuracy: geolocs.LocationAccuracy.high,
+  accuracy: geolocs.LocationAccuracy.bestForNavigation,
   activityType: geolocs.ActivityType.otherNavigation,
-  distanceFilter: 10,
+  distanceFilter: 4,
   showBackgroundLocationIndicator: true,
 );
+
+String _locationSettingsKey = '';
+DateTime? _locationBoostUntil;
+
+void updateDriverLocationSettings({
+  required bool onTrip,
+  required double speed,
+  required double accuracy,
+}) {
+  final now = DateTime.now();
+  final bool isDriver = userDetails['role'] == 'driver';
+  final dynamic _activeVal = userDetails['active'];
+  final dynamic _availVal = userDetails['available'];
+  final bool isActive = _activeVal == true || _activeVal == 1 || _activeVal == '1';
+  final bool isAvailable = _availVal == true || _availVal == 1 || _availVal == '1';
+  final bool isOnlineDriver = isDriver && (isActive || isAvailable);
+
+  final mode = onTrip
+      ? 'trip'
+      : (isOnlineDriver ? 'available' : (speed >= 1.5 ? 'moving' : 'idle'));
+  if (accuracy > 25.0 && speed > 3.0) {
+    _locationBoostUntil = now.add(const Duration(seconds: 15));
+  }
+  final useBoost =
+      _locationBoostUntil != null && now.isBefore(_locationBoostUntil!);
+  final key = '$mode|boost=$useBoost';
+  if (key == _locationSettingsKey) return;
+
+  if (platform == TargetPlatform.android) {
+    final accuracySetting = useBoost
+        ? geolocs.LocationAccuracy.bestForNavigation
+        : geolocs.LocationAccuracy.high;
+    final Duration interval = (mode == 'trip')
+        ? const Duration(seconds: 1)
+        : (mode == 'available')
+        ? const Duration(seconds: 1)
+        : (mode == 'moving')
+        ? const Duration(seconds: 2)
+        : const Duration(seconds: 10);
+    final int distanceFilter = (mode == 'trip')
+        ? 2
+        : (mode == 'available')
+        ? 2
+        : (mode == 'moving')
+        ? 5
+        : 25;
+    locationSettings = geolocs.AndroidSettings(
+      accuracy: accuracySetting,
+      distanceFilter: distanceFilter,
+      intervalDuration: interval,
+      foregroundNotificationConfig:
+      const geolocs.ForegroundNotificationConfig(
+        notificationText:
+        "Product Name will continue to receive your location in background",
+        notificationTitle: "Location background service running",
+        enableWakeLock: true,
+      ),
+    );
+  } else {
+    final accuracySetting = useBoost
+        ? geolocs.LocationAccuracy.bestForNavigation
+        : geolocs.LocationAccuracy.high;
+    final int distanceFilter = (mode == 'trip')
+        ? 4
+        : (mode == 'moving')
+        ? 8
+        : 25;
+    locationSettings = geolocs.AppleSettings(
+      accuracy: accuracySetting,
+      activityType: geolocs.ActivityType.otherNavigation,
+      distanceFilter: distanceFilter,
+      showBackgroundLocationIndicator: true,
+    );
+  }
+
+  _locationSettingsKey = key;
+  if (positionStream != null) {
+    positionStream?.cancel();
+    positionStream = null;
+    positionStreamStarted = false;
+    positionStreamData();
+  }
+}
 
 //after load image
 uploadLoadingImage(image) async {
@@ -5368,16 +5503,30 @@ dynamic testDistance = 0;
 // Location location = Location();
 
 positionStreamData() {
+  if (positionStream != null &&
+      positionStreamStarted &&
+      positionStream?.isPaused == false) {
+    return;
+  }
+  if (positionStream?.isPaused == true) {
+    positionStream?.cancel();
+    positionStream = null;
+    positionStreamStarted = false;
+  }
+  positionStreamStarted = true;
   positionStream =
       geolocs.Geolocator.getPositionStream(locationSettings: locationSettings)
           .handleError((error) {
         positionStream = null;
+        positionStreamStarted = false;
         positionStream?.cancel();
       }).listen((geolocs.Position? position) {
         if (position != null) {
           center = LatLng(position.latitude, position.longitude);
+          _positionStreamController.add(position);
         } else {
           positionStream!.cancel();
+          positionStreamStarted = false;
         }
       });
 }
