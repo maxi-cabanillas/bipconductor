@@ -654,16 +654,16 @@ class _MapsState extends State<Maps>
       }
 
       final settings = Platform.isAndroid
-          ? const geolocator.AndroidSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              distanceFilter: 10,
-              intervalDuration: Duration(seconds: 5),
-            )
-          : const geolocator.AppleSettings(
-              accuracy: geolocator.LocationAccuracy.high,
-              activityType: geolocator.ActivityType.otherNavigation,
-              distanceFilter: 10,
-            );
+          ? geolocator.AndroidSettings(
+        accuracy: geolocator.LocationAccuracy.high,
+        distanceFilter: 10,
+        intervalDuration: const Duration(seconds: 5),
+      )
+          : geolocator.AppleSettings(
+        accuracy: geolocator.LocationAccuracy.high,
+        activityType: geolocator.ActivityType.otherNavigation,
+        distanceFilter: 10,
+      );
 
       _livePosSub =
           geolocator.Geolocator.getPositionStream(locationSettings: settings)
@@ -779,15 +779,15 @@ class _MapsState extends State<Maps>
     );
 
     final headingDelta =
-        _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
+    _shortestAngleDelta(_lastUiDriverHeading, newHeading).abs();
 
     return moved >= 5.0 || headingDelta >= 3.0;
   }
 
   _NearestSnapPoint? _nearestPolylinePoint(
-    LatLng rawLatLng, {
-    double maxDistanceMeters = double.infinity,
-  }) {
+      LatLng rawLatLng, {
+        double maxDistanceMeters = double.infinity,
+      }) {
     final List<dynamic> snapPoints = mapType == 'google' ? polyList : fmpoly;
     if (snapPoints.isEmpty) return null;
 
