@@ -5142,7 +5142,7 @@ Map<String, dynamic> languages = {
     "text_vehicle_type": "¿Qué tipo de vehículo es?",
     "text_vehicle_color": "¿De qué color es el vehículo?",
     "text_license": "Número de vehículo",
-    "text_enter_vehicle": "Ingrese su número de vehículo",
+    "text_enter_vehicle": "Ingrese Patente del vehículo ",
     "text_vehicle_model_year": "¿Cuál es el año del modelo del vehículo?",
     "text_apply_referral": "Aplicar referencia",
     "text_enter_referral": "Ingrese el código de referencia",
